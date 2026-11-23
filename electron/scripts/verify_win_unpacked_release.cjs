@@ -1,0 +1,288 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const asar = require('@electron/asar');
+
+const electronRoot = path.resolve(__dirname, '..');
+const projectRoot = path.resolve(electronRoot, '..');
+const packageRoot = process.env.CATNIP_PACKAGE_ROOT
+  ? path.resolve(process.env.CATNIP_PACKAGE_ROOT)
+  : path.join(electronRoot, 'dist-package', 'Catnip_Forge');
+const resources = path.join(packageRoot, 'resources');
+const version = JSON.parse(fs.readFileSync(path.join(projectRoot, 'config', 'version.json'), 'utf-8'));
+const exe = path.join(packageRoot, 'Catnip_Forge.exe');
+const legacyExe = path.join(packageRoot, `${version.productName}.exe`);
+
+assert.equal(version.publicVersion, '2.0.0');
+assert.equal(version.buildNumber, 7201);
+assert(fs.existsSync(exe), `missing ${exe}`);
+assert(!fs.existsSync(legacyExe), `legacy branded executable must not remain: ${legacyExe}`);
+assert(fs.existsSync(path.join(packageRoot, 'README-FIRST.txt')), 'missing distribution README');
+assert(fs.existsSync(path.join(resources, 'app.asar')), 'missing app.asar');
+const assistantGuidePath = path.join(resources, 'CATNIP_FORGE_USER_GUIDE.md');
+assert(fs.existsSync(assistantGuidePath), 'missing editable software assistant guide');
+const assistantGuide = fs.readFileSync(assistantGuidePath, 'utf-8');
+assert(assistantGuide.includes('# Catnip Forge 软件使用手册'), 'software assistant guide title drifted');
+assert(
+  assistantGuide.includes('## 2. 模型配置与更换——首次使用应先完成')
+    && assistantGuide.includes('## 5. 探索总览与知乎连接')
+    && assistantGuide.includes('## 10. Neil 的线上 Skill 小站')
+    && assistantGuide.includes('## 11. 电台、仓库、编辑器、任务管理器与监视器')
+    && assistantGuide.includes('## 14. 回答与安全边界'),
+  'software assistant guide is incomplete',
+);
+assert(!fs.existsSync(path.join(resources, 'apikey.txt')), 'release must not contain a real apikey.txt');
+assert(!fs.existsSync(path.join(resources, 'qwen-apikey.txt')), 'release must not contain a real qwen-apikey.txt');
+const keyExample = fs.readFileSync(path.join(resources, 'apikey.txt.example'), 'utf-8');
+const keyLines = keyExample.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#'));
+assert.deepEqual(keyLines, ['DEEPSEEK_API_KEY=sk-your-key-here'], 'API key example must contain only the documented placeholder');
+const distributionReadme = fs.readFileSync(path.join(packageRoot, 'README-FIRST.txt'), 'utf-8');
+assert(distributionReadme.includes('v2.0.0（Build 7201）'), 'distribution README version drifted');
+assert(distributionReadme.includes('D:\\Catnip_Forge'), 'distribution README must recommend the current short product path');
+assert(!distributionReadme.includes('Odyssey'), 'distribution README contains the retired product name');
+
+const officialZhihuSkillFiles = [
+  'SKILL.md',
+  'manifest.json',
+  'scripts/run.ps1',
+  'scripts/run.sh',
+  'scripts/setup.ps1',
+  'scripts/setup.sh',
+  'references/cli.md',
+  'references/hackathon-content-api.md',
+  'references/hackathon-oauth.md',
+  'references/hackathon.md',
+  'references/http-api.md',
+  'references/mcp.md',
+  'references/oauth.md',
+  'references/open-platform.md',
+  'references/user-api.md',
+];
+
+const required = [
+  'agent/bin/catnip-agent.exe',
+  'agent/AGENT_RULES.md',
+  'agent/board-packs/esp32-s3-generic/manifest.json',
+  'agent/skills/espidf-hardboard/SKILL.md',
+  ...officialZhihuSkillFiles.map((relative) => `agent/skills/zhihu/${relative}`),
+  'electron/assets/icon.ico',
+  'electron/assets/icon.png',
+  'runtime/nodejs/node.exe',
+  'runtime/python/python.exe',
+  'runtime/python/opus.dll',
+  'runtime/python/python312._pth',
+  'runtime/python/Scripts/python.exe',
+  'runtime/python/Scripts/python312._pth',
+  'runtime/python/Scripts/python312.dll',
+  'runtime/python/Scripts/python3.dll',
+  'runtime/python/Lib/site-packages/serial',
+  'runtime/python/Lib/site-packages/click/core.py',
+  'runtime/python/Lib/site-packages/aiosqlite',
+  'runtime/python/Lib/site-packages/amqtt',
+  'runtime/python/Lib/site-packages/zeroconf',
+  'runtime/dist/index.js',
+  'runtime/dist/mcp/server.js',
+  'runtime/dist/mcp/attachment.tool.js',
+  'runtime/dist/attachment/client.js',
+  'runtime/playwright/chromium-1223',
+  'runtime/hardboard/esptools/esp-idf-v5.4.3/esp-idf',
+  'runtime/otto-master/config.electron.yaml',
+  'runtime/otto-master/src/otto_master/__main__.py',
+  'runtime/otto-master/src/otto_master/web/index.html',
+  'config/version.json',
+];
+for (const relative of required) {
+  assert(fs.existsSync(path.join(resources, relative)), `missing resources/${relative}`);
+}
+for (const relative of officialZhihuSkillFiles) {
+  const source = fs.readFileSync(path.join(projectRoot, 'agent', 'skills', 'zhihu', relative));
+  const packaged = fs.readFileSync(path.join(resources, 'agent', 'skills', 'zhihu', relative));
+  assert.deepEqual(packaged, source, `packaged official zhihu skill file changed: ${relative}`);
+}
+assert(!fs.existsSync(path.join(resources, 'agent', 'skills', 'zhihu', 'zhihu-cli.exe')), 'release must not bundle the user-installed zhihu CLI');
+for (const removedId of ['1688-source-finding', 'bilibili-search-workflow', 'douyin-product-rank', 'taobao-listing']) {
+  assert(!fs.existsSync(path.join(resources, 'agent', 'skills', removedId)), `release still contains removed skill: ${removedId}`);
+}
+assert(!fs.existsSync(path.join(resources, 'runtime', 'hardboard', 'projects', 'hello_world_esp32s3', '.catnip')), 'release must not contain project usage state');
+const bundledProjectNames = ['hello_world_esp32s3', 'otto_rainbow_cat', 'touch_hello', 'wifi_connect_fmai'];
+const packagedProjects = fs.readdirSync(path.join(resources, 'runtime', 'hardboard', 'projects'), { withFileTypes: true })
+  .filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+assert.deepEqual(packagedProjects, bundledProjectNames.slice().sort(), 'release must contain only the documented bundled projects');
+assert(!fs.existsSync(path.join(resources, 'runtime', 'hardboard', 'git-snapshots')), 'release must not contain personal project snapshots');
+for (const name of ['board_info_package.py', 'firmware_package.py']) {
+  assert.deepEqual(fs.readFileSync(path.join(resources, 'runtime', 'hardboard', 'scripts', name)), fs.readFileSync(path.join(projectRoot, 'runtime', 'hardboard', 'scripts', name)), `packaged ZIP validator differs: ${name}`);
+}
+const forbiddenMutableRoots = [
+  'agent/logs', 'agent/screenshots', 'agent/recordings',
+  'runtime/logs', 'runtime/chrome_profile', 'runtime/recordings',
+  'runtime/workflows', 'runtime/attachments',
+  'runtime/hardboard/logs', 'runtime/hardboard/events',
+  'runtime/hardboard/git-snapshots',
+  'runtime/otto-master/data',
+  'runtime/otto-master/logs',
+  'runtime/otto-master/.local-secrets',
+  'runtime/otto-master/firmware',
+];
+for (const relative of forbiddenMutableRoots) {
+  assert(!fs.existsSync(path.join(resources, relative)), `release contains mutable user-data directory: resources/${relative}`);
+}
+const forbiddenStateNames = new Set([
+  '.env', '.catnip', 'apikey.txt', 'qwen-apikey.txt',
+  'credentials.json', 'knowledge.json', 'conversations.json',
+  'radio.sqlite3', 'service.token', 'vault.key', 'otto.db', 'otto-master.jsonl', 'mqtt-credentials.json',
+]);
+const leakedState = [];
+const pendingStateScan = [resources];
+while (pendingStateScan.length) {
+  const current = pendingStateScan.pop();
+  for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    const candidate = path.join(current, entry.name);
+    if (forbiddenStateNames.has(entry.name.toLowerCase())) {
+      leakedState.push(path.relative(packageRoot, candidate));
+      continue;
+    }
+    if (entry.isDirectory()) pendingStateScan.push(candidate);
+  }
+}
+assert.deepEqual(leakedState, [], `release contains credential/history/knowledge/project state: ${leakedState.join(', ')}`);
+
+const packagedVersion = JSON.parse(fs.readFileSync(path.join(resources, 'config', 'version.json'), 'utf-8'));
+assert.deepEqual(packagedVersion, version, 'packaged version metadata drifted');
+const asarEntries = new Set(asar.listPackage(path.join(resources, 'app.asar')));
+for (const entry of [
+  '\\assets\\icon.ico',
+  '\\assets\\icon.png',
+  '\\assets\\splash.html',
+  '\\assets\\splash-cat.png',
+  '\\assets\\splash-leaf.png',
+  '\\assets\\splash-logo.png',
+  '\\dist\\main\\bootstrap.js',
+  '\\dist\\main\\user-data-path.js',
+  '\\dist\\main\\skill-manager.js',
+  '\\dist\\main\\attachment-bridge.js',
+  '\\dist\\main\\board-info.js',
+  '\\dist\\common\\agent-context.js',
+  '\\dist\\main\\attachment-store.js',
+  '\\dist\\renderer\\index.html',
+]) {
+  assert(asarEntries.has(entry), `app.asar missing ${entry}`);
+}
+
+const rendererBundleEntry = [...asarEntries].find((entry) => /^\\dist\\renderer\\assets\\index-[^\\]+\.js$/i.test(entry));
+assert(rendererBundleEntry, 'app.asar missing the main renderer bundle');
+const rendererBundle = asar.extractFile(path.join(resources, 'app.asar'), rendererBundleEntry.slice(1));
+for (const marker of ['探索', '找灵感', '解问题', '记录验证', '验证有效', '验证无效', '选择板卡信息包', '板卡资料保护区', 'chat-context-ring']) {
+  assert(rendererBundle.includes(Buffer.from(marker)), `packaged renderer missing Explore marker: ${marker}`);
+}
+
+const nodeVersion = run(path.join(resources, 'runtime', 'nodejs', 'node.exe'), ['--version']);
+const packagedPython = path.join(resources, 'runtime', 'python', 'python.exe');
+const packagedPythonRoot = path.dirname(packagedPython);
+const packagedIdfPath = path.join(resources, 'runtime', 'hardboard', 'esptools', 'esp-idf-v5.4.3', 'esp-idf');
+const packagedIdfToolsPath = path.join(resources, 'runtime', 'hardboard', 'esptools', 'idf-tools');
+const packagedPythonEnv = {
+  ...process.env,
+  PATH: `${packagedPythonRoot}${path.delimiter}${process.env.PATH || process.env.Path || ''}`,
+  PYTHONNOUSERSITE: '1',
+  PYTHONHOME: packagedPythonRoot,
+  IDF_PATH: packagedIdfPath,
+  IDF_TOOLS_PATH: packagedIdfToolsPath,
+  IDF_PYTHON_ENV_PATH: packagedPythonRoot,
+  IDF_PYTHON_CHECK_CONSTRAINTS: 'no',
+  ESP_IDF_VERSION: '5.4.3',
+};
+delete packagedPythonEnv.MSYSTEM;
+const pythonResult = JSON.parse(run(packagedPython, ['-c', [
+  'import json, pathlib, sys, serial, click.core, idf_component_manager, esptool, fastapi, uvicorn, httpx, websockets, cryptography, openai, edge_tts, mcp, aiosqlite, amqtt, zeroconf, opuslib_next',
+  'root = pathlib.Path(sys.executable).resolve().parent',
+  'modules = [serial, click.core, idf_component_manager, esptool, fastapi, uvicorn, httpx, websockets, cryptography, openai, edge_tts, mcp, aiosqlite, amqtt, zeroconf, opuslib_next]',
+  'print(json.dumps({"serial": serial.VERSION, "root": str(root), "modules": [str(pathlib.Path(module.__file__).resolve()) for module in modules]}))',
+].join('; ')], packageRoot, packagedPythonEnv));
+const scriptsPython = path.join(packagedPythonRoot, 'Scripts', 'python.exe');
+run(scriptsPython, ['-c', 'from cryptography import x509'], packageRoot, packagedPythonEnv);
+const idfVersion = run(packagedPython, [path.join(packagedIdfPath, 'tools', 'idf.py'), '--version'], packageRoot, packagedPythonEnv);
+const agentVersion = run(path.join(resources, 'agent', 'bin', 'catnip-agent.exe'), ['--version']);
+assert.match(nodeVersion, /^v\d+/);
+assert.equal(pythonResult.serial, '3.5');
+assert.equal(path.resolve(pythonResult.root), path.resolve(path.dirname(packagedPython)));
+assert.match(idfVersion, /ESP-IDF v5\.4\.3/);
+for (const modulePath of pythonResult.modules) {
+  assert(modulePath.toLowerCase().startsWith(path.dirname(packagedPython).toLowerCase()), `Python escaped bundled root: ${modulePath}`);
+}
+assert.match(agentVersion, /^catnip-agent .*rig-core 0\.44\.0; protocol 1/);
+assert(!fs.existsSync(path.join(resources, 'agent', 'node_modules')), 'obsolete Claude CLI must not be packaged');
+assert(!fs.existsSync(path.join(resources, 'agent', 'runtime')), 'Rust source/target must not be packaged');
+
+const runtimeDir = path.join(resources, 'runtime');
+const health = JSON.parse(run(path.join(runtimeDir, 'nodejs', 'node.exe'), [path.join(runtimeDir, 'dist', 'index.js'), 'health'], runtimeDir));
+assert.equal(health.ok, true);
+assert.equal(path.resolve(health.runtimeDir), path.resolve(runtimeDir));
+
+// Importing the packaged Runtime creates these empty operational directories.
+// A release verifier must leave the delivery directory as clean as it found it.
+for (const relative of [...forbiddenMutableRoots].sort((a, b) => b.length - a.length)) {
+  const candidate = path.join(resources, relative);
+  if (!fs.existsSync(candidate)) continue;
+  assert.deepEqual(fs.readdirSync(candidate), [], `runtime health wrote user data into resources/${relative}`);
+  fs.rmdirSync(candidate);
+}
+const postHealthLeaks = [];
+const postHealthScan = [resources];
+while (postHealthScan.length) {
+  const current = postHealthScan.pop();
+  for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+    const candidate = path.join(current, entry.name);
+    if (forbiddenStateNames.has(entry.name.toLowerCase())) {
+      postHealthLeaks.push(path.relative(packageRoot, candidate));
+      continue;
+    }
+    if (entry.isDirectory()) postHealthScan.push(candidate);
+  }
+}
+assert.deepEqual(postHealthLeaks, [], `runtime health left credential/history/knowledge/project state: ${postHealthLeaks.join(', ')}`);
+for (const relative of forbiddenMutableRoots) {
+  assert(!fs.existsSync(path.join(resources, relative)), `runtime health left mutable directory: resources/${relative}`);
+}
+
+const forbidden = ['C:\\Users\\HP', 'E:\\Agent\\vibeide\\vibeide'];
+for (const file of [
+  path.join(resources, 'runtime', 'dist', 'index.js'),
+  path.join(resources, 'runtime', 'dist', 'mcp', 'server.js'),
+  path.join(resources, 'config', 'version.json'),
+]) {
+  const text = fs.readFileSync(file, 'utf-8');
+  for (const value of forbidden) assert(!text.includes(value), `${file} contains developer-machine path ${value}`);
+}
+
+const totalBytes = directoryBytes(packageRoot);
+assert(totalBytes > 3_000_000_000, 'release appears incomplete (expected bundled toolchains)');
+console.log(JSON.stringify({
+  ok: true,
+  publicVersion: `v${version.publicVersion}`,
+  buildNumber: version.buildNumber,
+  exe,
+  totalBytes,
+  nodeVersion,
+  python: `isolated pyserial ${pythonResult.serial}`,
+  idfVersion,
+  agentVersion,
+  deepSeekApiKeyBundled: false,
+  qwenApiKeyBundled: false,
+}, null, 2));
+
+function run(command, args, cwd = packageRoot, env = process.env) {
+  const result = spawnSync(command, args, { cwd, env, encoding: 'utf-8', windowsHide: true, timeout: 30_000 });
+  if (result.status !== 0) throw new Error(`${command} failed (${result.status}): ${result.stderr || result.stdout}`);
+  return String(result.stdout || result.stderr).trim();
+}
+
+function directoryBytes(folder) {
+  let total = 0;
+  for (const entry of fs.readdirSync(folder, { withFileTypes: true })) {
+    const file = path.join(folder, entry.name);
+    if (entry.isDirectory()) total += directoryBytes(file);
+    else if (entry.isFile()) total += fs.statSync(file).size;
+  }
+  return total;
+}

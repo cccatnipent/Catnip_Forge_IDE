@@ -1,0 +1,9 @@
+# Checksummed Otto inputs and evidence must retain their original bytes.
+runtime/hardboard/board-adaptation-kits/otto-st7789-board-adaptation-kit-v1/** -text whitespace=cr-at-eol
+runtime/hardboard/workspaces/otto-st7789-cat-agent/** -text whitespace=cr-at-eol
+runtime/hardboard/firmware/otto-st7789-reference-firmware-v1/** -text whitespace=cr-at-eol
+runtime/hardboard/agent-adaptation-tests/otto-st7789-cat-v1/** -text whitespace=cr-at-eol
+runtime/hardboard/board-adaptation-kits/otto-st7789-board-adaptation-kit-v1/**/*.pdf -diff
+runtime/hardboard/board-adaptation-kits/otto-st7789-board-adaptation-kit-v1/**/*.log -diff
+runtime/hardboard/firmware/otto-st7789-reference-firmware-v1/**/*.log -diff
+runtime/hardboard/agent-adaptation-tests/otto-st7789-cat-v1/**/*.log -diff

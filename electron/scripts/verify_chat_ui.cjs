@@ -1,0 +1,341 @@
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+const CDP_LIST = 'http://127.0.0.1:9230/json';
+const expectedRendererRoot = process.env.CATNIP_EXPECTED_RENDERER_ROOT
+  ? path.resolve(process.env.CATNIP_EXPECTED_RENDERER_ROOT)
+  : null;
+const expectedAppUrlPrefix = expectedRendererRoot
+  ? pathToFileURL(path.join(expectedRendererRoot, 'resources', 'app.asar')).href.toLowerCase()
+  : null;
+
+async function findRendererTarget() {
+  let discoveredUrls = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      const targets = await fetch(CDP_LIST).then((response) => response.json());
+      const candidates = targets.filter((entry) => entry.type === 'page' && entry.title?.includes('Catnip Forge ·'));
+      discoveredUrls = candidates.map((entry) => entry.url);
+      const target = candidates.find((entry) => !expectedAppUrlPrefix || entry.url?.toLowerCase().startsWith(expectedAppUrlPrefix));
+      if (target?.webSocketDebuggerUrl) return target;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const expected = expectedRendererRoot ? `，预期成品根目录 ${expectedRendererRoot}` : '';
+  throw new Error(`未找到匹配的 Catnip Forge 主界面 Renderer CDP target${expected}；已发现 ${JSON.stringify(discoveredUrls)}`);
+}
+
+async function cdpCall(socket, id, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.removeEventListener('message', onMessage);
+      reject(new Error(`CDP ${method} 超时`));
+    }, 30000);
+    const onMessage = (event) => {
+      const message = JSON.parse(String(event.data));
+      if (message.id !== id) return;
+      clearTimeout(timer);
+      socket.removeEventListener('message', onMessage);
+      if (message.error) reject(new Error(message.error.message));
+      else resolve(message.result);
+    };
+    socket.addEventListener('message', onMessage);
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+}
+
+async function main() {
+  const target = await findRendererTarget();
+
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener('open', resolve, { once: true });
+    socket.addEventListener('error', reject, { once: true });
+  });
+
+  try {
+    const expression = `(async () => {
+      window.__vibeideChatSmokeStage = 'started';
+      const waitFor = (check) => {
+        const current = check();
+        if (current) return Promise.resolve(current);
+        return new Promise((resolve) => {
+          let timer;
+          const observer = new MutationObserver(() => {
+            const value = check();
+            if (!value) return;
+            observer.disconnect();
+            clearInterval(timer);
+            resolve(value);
+          });
+          timer = setInterval(() => {
+            const value = check();
+            if (!value) return;
+            observer.disconnect();
+            clearInterval(timer);
+            resolve(value);
+          }, 25);
+          observer.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
+        });
+      };
+      await waitFor(() => document.readyState === 'complete');
+      // The main window becomes discoverable before session and Skill hydration
+      // finish. Let those startup updates settle so they cannot replace controls
+      // halfway through the interaction sequence.
+      await new Promise((resolve) => setTimeout(resolve, 7_000));
+      const button = [...document.querySelectorAll('button')].find((item) => item.textContent?.trim() === '专业视图');
+      if (!button) return { ok: false, reason: 'missing professional view button' };
+      const skillButton = [...document.querySelectorAll('button')].find((item) => item.textContent?.trim().startsWith('＋ Skills'));
+      const composer = document.querySelector('.chat-input textarea');
+      const composerEditor = document.querySelector('.chat-composer-editor');
+      const composerResizeHandle = document.querySelector('.chat-composer-resize-handle');
+      if (!skillButton || !composer || !composerEditor || !composerResizeHandle) return { ok: false, reason: 'missing multi-skill composer controls' };
+      const originalComposerHeight = composerEditor.getBoundingClientRect().height;
+      composerResizeHandle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientY: 200 }));
+      window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 600 }));
+      window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 600 }));
+      await waitFor(() => composerEditor.getBoundingClientRect().height <= 64);
+      const initialComposerHeight = composerEditor.getBoundingClientRect().height;
+      composerResizeHandle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientY: 200 }));
+      window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 152 }));
+      window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 152 }));
+      await waitFor(() => composerEditor.getBoundingClientRect().height >= initialComposerHeight + 40);
+      const expandedComposerRect = composerEditor.getBoundingClientRect();
+      const textareaRect = composer.getBoundingClientRect();
+      const highlightRect = document.querySelector('.chat-input-highlight').getBoundingClientRect();
+      const highlight = document.querySelector('.chat-input-highlight');
+      const textareaStyle = getComputedStyle(composer);
+      const highlightStyle = getComputedStyle(highlight);
+      const textMetricKeys = [
+        'font', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'fontStretch',
+        'lineHeight', 'letterSpacing', 'wordSpacing', 'textIndent', 'textTransform',
+        'fontKerning', 'fontFeatureSettings', 'fontVariationSettings', 'textRendering',
+        'whiteSpace', 'overflowWrap', 'tabSize',
+      ];
+      const composerTextGeometryAligned = composer.clientWidth === highlight.clientWidth
+        && textareaStyle.boxSizing === highlightStyle.boxSizing
+        && textareaStyle.padding === highlightStyle.padding
+        && textareaStyle.borderWidth === highlightStyle.borderWidth
+        && textMetricKeys.every((key) => textareaStyle[key] === highlightStyle[key])
+        && textareaStyle.scrollbarGutter === highlightStyle.scrollbarGutter;
+      const composerTextGeometry = {
+        textareaClientWidth: composer.clientWidth,
+        highlightClientWidth: highlight.clientWidth,
+        textarea: Object.fromEntries(['boxSizing', 'padding', 'borderWidth', ...textMetricKeys, 'scrollbarGutter'].map((key) => [key, textareaStyle[key]])),
+        highlight: Object.fromEntries(['boxSizing', 'padding', 'borderWidth', ...textMetricKeys, 'scrollbarGutter'].map((key) => [key, highlightStyle[key]])),
+      };
+      const expandedComposerHeight = expandedComposerRect.height;
+      const composerResizable = expandedComposerHeight > initialComposerHeight
+        && Math.abs(expandedComposerHeight - highlightRect.height) < 1
+        && Math.abs(expandedComposerHeight - textareaRect.height) < 1
+        && Math.abs(expandedComposerRect.top - textareaRect.top) < 1
+        && Math.abs(expandedComposerRect.bottom - textareaRect.bottom) < 1
+        && Number(composerResizeHandle.getAttribute('aria-valuenow')) === Math.round(expandedComposerHeight);
+      composerResizeHandle.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientY: 200 }));
+      window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientY: 200 + expandedComposerHeight - originalComposerHeight }));
+      window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientY: 200 + expandedComposerHeight - originalComposerHeight }));
+      await waitFor(() => Math.abs(composerEditor.getBoundingClientRect().height - originalComposerHeight) < 1);
+      window.__vibeideChatSmokeStage = 'skill-controls-ready';
+      skillButton.click();
+      window.__vibeideChatSmokeStage = 'skill-picker-clicked';
+      const skillOptions = await waitFor(() => {
+        const options = [...document.querySelectorAll('.chat-skill-options button:not(:disabled)')];
+        return options.length >= 2 ? options : null;
+      });
+      const skillReferenceStyle = getComputedStyle(skillOptions[0].querySelector('code'));
+      const skillReferenceFontSize = skillReferenceStyle.fontSize;
+      const skillReferenceFontWeight = skillReferenceStyle.fontWeight;
+      const skillReferenceReadable = parseFloat(skillReferenceFontSize) >= 12
+        && Number(skillReferenceFontWeight) >= 600;
+      window.__vibeideChatSmokeStage = 'skill-options-ready';
+      skillOptions[0].click();
+      await waitFor(() => composer.value.includes('@'));
+      await waitFor(() => !document.querySelector('.chat-skill-picker'));
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const firstSkillFocusReturned = document.activeElement === composer;
+      window.__vibeideChatSmokeStage = 'first-skill-inserted';
+      const firstSkillText = composer.value;
+      skillButton.click();
+      const secondSkillOptions = await waitFor(() => {
+        const options = [...document.querySelectorAll('.chat-skill-options button:not(:disabled)')];
+        return options.length >= 2 ? options : null;
+      });
+      secondSkillOptions[1].click();
+      await waitFor(() => (composer.value.match(/@[a-z0-9-]+/g) || []).length >= 2);
+      await waitFor(() => !document.querySelector('.chat-skill-picker'));
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const skillPickerReturnsFocus = firstSkillFocusReturned && document.activeElement === composer;
+      window.__vibeideChatSmokeStage = 'second-skill-inserted';
+      const secondSkillText = composer.value;
+      const skillInlineMulti = new Set(secondSkillText.match(/@[a-z0-9-]+/g) || []).size >= 2
+        && secondSkillText.indexOf('@') !== secondSkillText.lastIndexOf('@');
+      const skillMarkers = [...document.querySelectorAll('.chat-input-highlight .chat-inline-skill')];
+      const skillMarkerStyles = skillMarkers.map((marker) => getComputedStyle(marker));
+      const composerHighlightStyle = getComputedStyle(document.querySelector('.chat-input-highlight'));
+      const skillMarkerHighlight = skillMarkers.length >= 2
+        && skillMarkerStyles.every((style) => style.backgroundImage !== 'none' && parseFloat(style.borderRadius) > 0)
+        && skillMarkerStyles[0].backgroundImage !== skillMarkerStyles[1].backgroundImage;
+      const skillMarkerLayoutSafe = skillMarkerStyles.every((style) =>
+        parseFloat(style.paddingLeft) === 0
+        && parseFloat(style.paddingRight) === 0
+        && parseFloat(style.marginLeft) === 0
+        && parseFloat(style.marginRight) === 0
+        && style.fontFamily === composerHighlightStyle.fontFamily
+        && style.fontSize === composerHighlightStyle.fontSize
+        && style.fontWeight === composerHighlightStyle.fontWeight);
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true, cancelable: true }));
+      await waitFor(() => (composer.value.match(/@[a-z0-9-]+/g) || []).length === 1);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const skillAtomicBackspace = composer.value === firstSkillText
+        && document.querySelectorAll('.chat-input-highlight .chat-inline-skill').length === 1
+        && document.activeElement === composer;
+      const textareaValueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      textareaValueSetter.call(composer, '');
+      composer.dispatchEvent(new Event('input', { bubbles: true }));
+      window.__vibeideChatSmokeStage = 'skill-composer-cleaned';
+      const legacyProgressPanel = Boolean(document.querySelector('.left-panel > .task-progress'));
+      const idleDashboardVisible = Boolean(document.querySelector('.chat-task-dashboard'));
+      const historySidebar = Boolean(document.querySelector('.chat-history'));
+      const conversationPane = Boolean(document.querySelector('.chat-conversation'));
+      const visibleMessagesBefore = document.querySelectorAll('.chat-msg, .chat-execution').length;
+      const historyBefore = document.querySelectorAll('.chat-history-item').length;
+      const listBefore = await window.electronAPI.listChatConversations();
+      window.__vibeideChatSmokeStage = 'history-loaded';
+      const original = listBefore.conversations.find((item) => item.id === listBefore.activeConversationId);
+      if (!original) return { ok: false, reason: 'missing active conversation summary' };
+      let activeMore = document.querySelector('.chat-history-item.is-active .chat-history-more');
+      if (!activeMore) return { ok: false, reason: 'missing active conversation menu button' };
+      activeMore.click();
+      window.__vibeideChatSmokeStage = 'history-menu-clicked';
+      const renameAction = await waitFor(() => [...document.querySelectorAll('.chat-history-menu button')].find((item) => item.textContent?.trim() === '重命名'));
+      if (!renameAction) return { ok: false, reason: 'missing rename action' };
+      const firstMenu = document.querySelector('.chat-history-item:first-child .chat-history-menu');
+      const firstTrigger = document.querySelector('.chat-history-item:first-child .chat-history-more');
+      const menuPlacementOk = !firstMenu || !firstTrigger || firstMenu.getBoundingClientRect().top >= firstTrigger.getBoundingClientRect().bottom - 1;
+      renameAction.click();
+      const renameInput = await waitFor(() => document.querySelector('.chat-history-item.is-active .chat-history-rename input'));
+      if (!renameInput) return { ok: false, reason: 'missing rename input' };
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      valueSetter.call(renameInput, '界面烟测对话');
+      renameInput.dispatchEvent(new Event('input', { bubbles: true }));
+      renameInput.blur();
+      const renamed = await waitFor(() => document.querySelector('.chat-history-item.is-active .chat-history-select span')?.textContent?.includes('界面烟测对话'));
+      activeMore = document.querySelector('.chat-history-item.is-active .chat-history-more');
+      activeMore.click();
+      const restoreRenameAction = await waitFor(() => [...document.querySelectorAll('.chat-history-menu button')].find((item) => item.textContent?.trim() === '重命名'));
+      restoreRenameAction.click();
+      const restoreInput = await waitFor(() => document.querySelector('.chat-history-item.is-active .chat-history-rename input'));
+      valueSetter.call(restoreInput, original.title);
+      restoreInput.dispatchEvent(new Event('input', { bubbles: true }));
+      restoreInput.blur();
+      await waitFor(() => document.querySelector('.chat-history-item.is-active .chat-history-select span')?.textContent?.includes(original.title));
+      activeMore = document.querySelector('.chat-history-item.is-active .chat-history-more');
+      activeMore.click();
+      const pinAction = await waitFor(() => [...document.querySelectorAll('.chat-history-menu button')].find((item) => item.textContent?.trim().endsWith('置顶')));
+      if (!pinAction) return { ok: false, reason: 'missing pin action' };
+      const expectedPinned = pinAction.textContent?.trim() === '置顶';
+      pinAction.click();
+      await waitFor(() => Boolean(document.querySelector('.chat-history-item.is-active.is-pinned')) === expectedPinned);
+      const pinToggled = true;
+      if (expectedPinned !== original.pinned) {
+        activeMore = document.querySelector('.chat-history-item.is-active .chat-history-more');
+        activeMore.click();
+        const restorePinAction = await waitFor(() => [...document.querySelectorAll('.chat-history-menu button')].find((item) => item.textContent?.trim().endsWith('置顶')));
+        restorePinAction.click();
+        if (original.pinned) await waitFor(() => Boolean(document.querySelector('.chat-history-item.is-active.is-pinned')));
+        else await window.electronAPI.setChatConversationPinned(original.id, false);
+      }
+      activeMore = document.querySelector('.chat-history-item.is-active .chat-history-more');
+      activeMore.click();
+      const deleteAction = await waitFor(() => [...document.querySelectorAll('.chat-history-menu button')].find((item) => item.textContent?.trim() === '删除'));
+      if (!deleteAction) return { ok: false, reason: 'missing delete action' };
+      deleteAction.click();
+      const confirmDelete = await waitFor(() => document.querySelector('.chat-history-item.is-active .chat-history-confirm .is-danger'));
+      if (!confirmDelete) return { ok: false, reason: 'missing conversation delete confirmation' };
+      const cancelDelete = document.querySelector('.chat-history-item.is-active .chat-history-confirm button:not(.is-danger)');
+      cancelDelete?.click();
+      const deleteConfirmed = true;
+      const before = button.getAttribute('aria-pressed');
+      button.click();
+      const after = await waitFor(() => button.getAttribute('aria-pressed') !== before ? button.getAttribute('aria-pressed') : null);
+      const stored = localStorage.getItem('vibeide.chat.professionalView');
+      button.click();
+      await waitFor(() => button.getAttribute('aria-pressed') === before);
+      return {
+        ok: before !== after
+          && stored === after
+          && historySidebar
+          && conversationPane
+          && renamed
+          && pinToggled
+          && deleteConfirmed
+          && menuPlacementOk
+          && composerResizable
+          && composerTextGeometryAligned
+          && skillReferenceReadable
+          && skillInlineMulti
+          && skillMarkerHighlight
+          && skillMarkerLayoutSafe
+          && skillPickerReturnsFocus
+          && skillAtomicBackspace
+          && !legacyProgressPanel
+          && !idleDashboardVisible,
+        before,
+        after,
+        stored,
+        legacyProgressPanel,
+        idleDashboardVisible,
+        historySidebar,
+        conversationPane,
+        visibleMessagesBefore,
+        historyBefore,
+        renamed,
+        pinToggled,
+        deleteConfirmed,
+        menuPlacementOk,
+        composerResizable,
+        composerTextGeometryAligned,
+        composerTextGeometry,
+        originalComposerHeight,
+        initialComposerHeight,
+        expandedComposerHeight,
+        expandedTextareaHeight: textareaRect.height,
+        expandedHighlightHeight: highlightRect.height,
+        skillReferenceReadable,
+        skillReferenceFontSize,
+        skillReferenceFontWeight,
+        skillInlineMulti,
+        skillMarkerHighlight,
+        skillMarkerLayoutSafe,
+        skillPickerReturnsFocus,
+        skillAtomicBackspace,
+        firstSkillText,
+        secondSkillText,
+        theme: document.documentElement.dataset.theme,
+        readyState: document.readyState,
+      };
+    })()`;
+    let evaluated;
+    try {
+      evaluated = await cdpCall(socket, 1, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+    } catch (error) {
+      const probe = await cdpCall(socket, 2, 'Runtime.evaluate', {
+        expression: `(async () => ({ stage: window.__vibeideChatSmokeStage, ready: document.readyState, items: document.querySelectorAll('.chat-history-item').length, moreDisabled: document.querySelector('.chat-history-item.is-active .chat-history-more')?.disabled, expanded: document.querySelector('.chat-history-item.is-active .chat-history-more')?.getAttribute('aria-expanded'), menus: document.querySelectorAll('.chat-history-menu').length, picker: Boolean(document.querySelector('.chat-skill-picker')), options: document.querySelectorAll('.chat-skill-options button').length, pickerError: document.querySelector('.chat-skill-error')?.textContent, skillResult: await window.electronAPI.listManagedSkills() }))()`,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; probe=${JSON.stringify(probe.result?.value)}`);
+    }
+    const result = evaluated.result?.value;
+    if (!result?.ok) throw new Error(`专业视图交互校验失败: ${JSON.stringify(result)}`);
+
+    console.log(JSON.stringify({ ...result, targetUrl: target.url, expectedRendererRoot }, null, 2));
+  } finally {
+    socket.close();
+  }
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.stack : String(error));
+  process.exitCode = 1;
+});

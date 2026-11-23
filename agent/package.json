@@ -1,0 +1,9 @@
+{
+  "name": "@vibeide/agent",
+  "version": "2.0.0-7201",
+  "private": true,
+  "scripts": {
+    "build": "node ../electron/scripts/build_rig_agent.cjs",
+    "verify": "node ../electron/scripts/verify_rig_protocol.cjs"
+  }
+}

@@ -1,0 +1,144 @@
+appId: com.vibeide.app
+productName: Catnip Forge
+buildVersion: 2.0.0.7201
+artifactName: "${productName}-${os}-${arch}.${ext}"
+
+directories:
+  output: dist-package
+
+extraFiles:
+  - from: DISTRIBUTION_README.txt
+    to: README-FIRST.txt
+
+files:
+  - dist/**/*
+  - package.json
+  - assets/**/*
+
+extraResources:
+  - from: apikey.txt.example
+    to: apikey.txt.example
+  - from: CATNIP_FORGE_USER_GUIDE.md
+    to: CATNIP_FORGE_USER_GUIDE.md
+  - from: assets
+    to: electron/assets
+    filter:
+      - "icon.ico"
+      - "icon.png"
+  - from: ../agent
+    to: agent
+    filter:
+      - "**/*"
+      - "!logs/**"
+      - "!screenshots/**"
+      - "!recordings/**"
+      - "!*.html"
+      - "!*.png"
+      - "!node_modules/.cache/**"
+      - "!node_modules/**"
+      - "!runtime/**"
+      - "!.claude/**"
+      - "!.catnip/**"
+  - from: ../runtime/dist
+    to: runtime/dist
+  - from: ../runtime/otto-master
+    to: runtime/otto-master
+    filter:
+      - "**/*"
+      - "!data/**"
+      - "!logs/**"
+      - "!firmware/**"
+      - "!.local-secrets/**"
+      - "!.venv/**"
+      - "!**/.env"
+      - "!**/.env.*"
+      - "!tests/**"
+      - "!docs/**"
+      - "!scripts/**"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+  - from: ../runtime/package.json
+    to: runtime/package.json
+  - from: ../runtime/node_modules
+    to: runtime/node_modules
+    filter:
+      - "**/*"
+      - "!**/.cache/**"
+      - "!chrome_profile/**"
+      - "!recordings/**"
+      - "!workflows/**"
+      - "!logs/**"
+  - from: ../runtime/hardboard
+    to: runtime/hardboard
+    filter:
+      - "**/*"
+      - "!git-snapshots/**"
+      - "!projects/!(hello_world_esp32s3|otto_rainbow_cat|touch_hello|wifi_connect_fmai)/**"
+      - "!**/build/**"
+      - "!**/.git/**"
+      - "!**/.catnip/**"
+      - "!**/__pycache__/**"
+      - "!**/.cache/**"
+      - "!esptools/esp-idf-v*/esp-idf/examples/**"
+      - "!esptools/idf-tools/python_env/**"
+      - "!logs/**"
+      - "!events/**"
+  - from: ../scripts
+    to: scripts
+    filter:
+      - "**/*"
+      - "!__pycache__/**"
+  - from: ../config
+    to: config
+  - from: ../_bundled/nodejs
+    to: runtime/nodejs
+  - from: ../_bundled/python
+    to: runtime/python
+    filter:
+      - "**/*"
+      - "!python312._pth.disabled*"
+  - from: ../_bundled/python/python.exe
+    to: runtime/python/Scripts/python.exe
+  - from: ../_bundled/python/python312.dll
+    to: runtime/python/Scripts/python312.dll
+  - from: ../_bundled/python/python3.dll
+    to: runtime/python/Scripts/python3.dll
+  - from: ../runtime/python/python312-scripts._pth
+    to: runtime/python/Scripts/python312._pth
+  - from: ../runtime/python/sitecustomize.py
+    to: runtime/python/Lib/site-packages/sitecustomize.py
+  - from: ../_bundled/playwright
+    to: runtime/playwright
+
+asarUnpack:
+  - "**/agent/**"
+  - "**/runtime/**"
+  - "**/scripts/**"
+  - "**/config/**"
+
+win:
+  icon: assets/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+linux:
+  icon: assets/icon.png
+  target:
+    - AppImage
+    - deb
+
+mac:
+  icon: assets/icon.png
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip

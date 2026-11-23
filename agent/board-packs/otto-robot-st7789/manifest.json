@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "otto-robot-st7789",
+  "version": "1.0.0",
+  "name": "Otto Robot（ST7789 240×240 串行屏，基础/无摄像头版）",
+  "chip": "esp32s3",
+  "toolchain": { "framework": "esp-idf", "version": "5.4.3", "source": "existing-hardboard" },
+  "display": {
+    "controller": "ST7789",
+    "interface": "SPI",
+    "width": 240,
+    "height": 240,
+    "spiMode": 3,
+    "pixelClockHz": 40000000,
+    "rgbOrder": "RGB",
+    "invertColor": true,
+    "mirrorX": false,
+    "mirrorY": false,
+    "swapXY": false,
+    "offsetX": 0,
+    "offsetY": 0,
+    "backlight": { "gpio": 3, "activeHigh": true }
+  },
+  "pins": {
+    "lcd": { "mosi": 10, "sclk": 9, "dc": 46, "reset": 11, "cs": 12, "backlight": 3 },
+    "bootButton": 0,
+    "camera": null,
+    "audio": { "micWs": 4, "micSck": 5, "micDin": 6, "speakerDout": 7, "speakerBclk": 15, "speakerLrck": 16 }
+  },
+  "documents": ["README.md", "HARDWARE.md", "VALIDATION.md"],
+  "sources": [
+    "https://github.com/txp666/xiaozhi-esp32/tree/main/main/boards/otto-robot",
+    "https://github.com/txp666/xiaozhi-esp32/blob/main/main/boards/otto-robot/config.h",
+    "https://github.com/txp666/xiaozhi-esp32/blob/main/main/boards/otto-robot/otto_robot.cc",
+    "https://docs.espressif.com/projects/esp-idf/en/v5.4.3/esp32s3/",
+    "https://docs.espressif.com/projects/esp-idf/en/v5.4.3/esp32s3/api-reference/peripherals/lcd.html"
+  ],
+  "validationStatus": "REAL_DEVICE_DISPLAY_VALIDATED",
+  "evidence": {
+    "boardIdentity": "COM10 USB 303A:1001; ESP32-S3 v0.2; 16 MB Flash; 8 MB PSRAM",
+    "schematic": "LCD-240x240 connector and LCD_BL/LCD_DC/LCD_SCL/LCD_SDA/LCD_RST nets in the user-provided Otto schematic",
+    "upstreamConfig": "NON_CAMERA_VERSION_CONFIG and LCD_TYPE_ST7789_SERIAL in txp666/xiaozhi-esp32",
+    "buildFlashSerial": "ESP-IDF 5.4.3 set-target/build passed; idf.py -p COM10 flash passed without erase-flash; serial captured NYAN_ASSET, RAINBOW_CAT_READY, and animation heartbeats",
+    "testAsset": "MIT cristurm/nyan-cat; eight committed 240x240 PNG captures converted offline to shared 24-color RGB565 RLE",
+    "remainingUnknowns": ["exact physical board revision", "exact panel vendor"]
+  }
+}

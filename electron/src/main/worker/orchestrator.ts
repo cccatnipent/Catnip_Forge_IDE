@@ -1,0 +1,1349 @@
+import { BrowserWindow } from 'electron';
+import { randomUUID } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
+import { ensureAgentProcess, killAgent, getAgentProcess, sendAgentMessage, type AgentExecutionProfile, type AgentSessionBinding } from '../agent';
+import { loadURL, getBrowserView } from '../browser-view';
+import { TaskStateMachine } from './task-state';
+import { buildContext, taskWantsBrowser } from './context';
+import { ChatBuffer, ParsedChunk } from './chat-buffer';
+import { logger } from './logger';
+import { isHtmlGameTask, validateCurrentPage } from './page-validator';
+import { appendClaudeSessionTurn, buildClaudeSessionContext, getClaudeSessionFile, listChatConversations } from './session-store';
+import { listManagedSkills } from '../skill-manager';
+import { buildAttachmentPromptContext, type AttachmentReference } from '../attachment-store';
+import { getActiveProject } from '../project-session';
+import {
+  hydrateEngineeringAgentModel,
+  snapshotEngineeringAgentModel,
+  type EngineeringAgentModelSnapshot,
+  type EngineeringAgentRuntimeModel,
+} from '../agent-model-selection';
+import {
+  normalizeExploreExecutionConfirmRequest,
+  normalizeHandoffContext,
+  normalizeExploreAnalysisResult,
+  normalizeExploreRequest,
+  type ExploreAnalysisExpectation,
+  type ExploreAnalysisResult,
+  type ExplorePlanResult,
+  type ExploreRequest,
+  type HandoffContext,
+  type SourceEvidence,
+} from '../../common/explore';
+import type { AgentContextUsage } from '../../common/agent-context';
+import { agentToolActivityLabel, type AgentActivity } from '../../common/agent-activity';
+import { normalizeResponseStreamId } from '../../common/chat-stream';
+
+export type PushUIFn = (channel: string, data: unknown) => void;
+export type TaskSubmitMode = 'auto' | 'guide' | 'queue';
+
+export interface SkillReference {
+  id: string;
+  name: string;
+  start: number;
+  end: number;
+}
+
+export interface AgentTaskInput {
+  text: string;
+  skillRefs: SkillReference[];
+  attachments: AttachmentReference[];
+}
+
+export interface TaskSubmitResult {
+  ok: boolean;
+  disposition: 'started' | 'guided' | 'queued';
+  taskId: string;
+  activeTaskId: string | null;
+  queueLength: number;
+  guidanceCount: number;
+}
+
+interface QueuedTask {
+  id: string;
+  text: string;
+  skillRefs: SkillReference[];
+  attachments: AttachmentReference[];
+  conversationId: string;
+  executionProfile: AgentExecutionProfile;
+  modelSnapshot: EngineeringAgentModelSnapshot;
+  exploreExpectation?: ExploreAnalysisExpectation;
+}
+
+export function routeAgentUiEvent(
+  profile: AgentExecutionProfile,
+  channel: string,
+  payload: unknown,
+  expectation?: ExploreAnalysisExpectation | null,
+): { channel: string; payload: unknown } {
+  if (channel !== 'chat:message' || !isRestrictedExploreProfile(profile)) return { channel, payload };
+  return {
+    channel: 'explore:conversation:message',
+    payload: {
+      ...(payload && typeof payload === 'object' ? payload : {}),
+      requestId: expectation?.requestId,
+      mode: profile === 'explore_plan' ? 'plan' : 'analysis',
+    },
+  };
+}
+
+interface ConfirmableExplorePlan {
+  handoff: HandoffContext;
+  conversationId: string;
+  projectId?: string;
+  createdAt: number;
+  completedAt?: number;
+  result?: ExplorePlanResult;
+  usedAt?: number;
+}
+
+function bindActiveProject(text: string): { text: string; projectId?: string } {
+  const project = getActiveProject();
+  if (!project) return { text };
+  return {
+    projectId: project.id,
+    text: [
+      '【当前工作工程】',
+      '工程 ID：' + project.id,
+      '工程目录：' + project.projectDir,
+      '所有工程源码读写、Build、Flash、Serial 分析和验证都必须限定在该工程；不得沿用历史对话中的其他工程路径。',
+      '【当前工作工程结束】',
+      text,
+    ].join('\n'),
+  };
+}
+
+interface TaskContinuation {
+  kind: 'guidance' | 'validation' | 'resume' | 'skill-enforcement';
+  text: string;
+}
+
+export function isExploreAnalysisToolAllowed(toolName: string): boolean {
+  return toolName === 'Skill' || toolName === 'StructuredOutput';
+}
+
+export function isRestrictedExploreProfile(profile: AgentExecutionProfile): boolean {
+  return profile === 'explore_analysis' || profile === 'explore_plan';
+}
+
+export function isExploreToolAllowed(profile: AgentExecutionProfile, toolName: string): boolean {
+  if (toolName === 'StructuredOutput') return isRestrictedExploreProfile(profile);
+  return profile === 'explore_analysis' && toolName === 'Skill';
+}
+
+export function canAppendTaskGuidance(
+  activeProfile: AgentExecutionProfile,
+  incomingProfile: AgentExecutionProfile,
+): boolean {
+  return activeProfile === 'default' && incomingProfile === 'default';
+}
+
+export function agentStderrForUI(profile: AgentExecutionProfile, text: string): string {
+  return isRestrictedExploreProfile(profile)
+    ? '[Agent] Explore 受限分析进程报告错误，原始输出已隐藏。'
+    : text;
+}
+
+export function agentTextForLog(profile: AgentExecutionProfile, text: string): string {
+  return isRestrictedExploreProfile(profile) ? '[restricted explore content hidden]' : text;
+}
+
+export function parseExploreAnalysisResultText(
+  text: string,
+  expectation: ExploreAnalysisExpectation,
+): ExploreAnalysisResult {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('```') || trimmed.endsWith('```')) {
+    throw new Error('Explore analysis result must be plain JSON');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error('Explore analysis result must be valid JSON');
+  }
+  return normalizeExploreAnalysisResult(parsed, expectation);
+}
+
+export function normalizeAgentTaskInput(input: string | AgentTaskInput): AgentTaskInput {
+  const text = (typeof input === 'string' ? input : input.text).trim();
+  if (!text) throw new Error('任务内容不能为空');
+  const available = new Map(listManagedSkills().skills.filter((skill) => skill.deployed).map((skill) => [skill.id, skill]));
+  const rawRefs = typeof input === 'string' || !Array.isArray(input.skillRefs) ? [] : input.skillRefs;
+  if (rawRefs.length > 8) throw new Error('一条消息最多显式引用 8 个 Skill');
+  const seen = new Set<string>();
+  const skillRefs: SkillReference[] = [];
+  for (const ref of rawRefs) {
+    const id = String(ref?.id || '').trim().toLowerCase();
+    const skill = available.get(id);
+    if (!skill) throw new Error(`Skill 未部署或不存在：@${id || 'unknown'}`);
+    const start = Number(ref.start);
+    const end = Number(ref.end);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || text.slice(start, end) !== `@${id}`) {
+      throw new Error(`Skill 引用位置无效：@${id}`);
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    skillRefs.push({ id, name: skill.name, start, end });
+  }
+  const rawAttachments = typeof input === 'string' || !Array.isArray(input.attachments) ? [] : input.attachments;
+  if (rawAttachments.length > 6) throw new Error('一条消息最多包含 6 个附件');
+  const attachments = rawAttachments
+    .filter((item) => item && /^att_[a-f0-9]{32}$/.test(String(item.id || '')))
+    .map((item) => ({
+      id: String(item.id),
+      name: String(item.name || '').slice(0, 180),
+      mimeType: String(item.mimeType || ''),
+      size: Number(item.size) || 0,
+      kind: item.kind,
+      textAvailable: Boolean(item.textAvailable),
+      warning: item.warning ? String(item.warning).slice(0, 500) : undefined,
+    })) as AttachmentReference[];
+  return { text, skillRefs, attachments };
+}
+
+export function agentFailureMessage(code: string | null): string {
+  if (code === 'MODEL_OUTPUT_LIMIT_REACHED') return '模型输出达到本次上限，未执行这次不完整的工具调用。历史已保留，可分阶段继续。';
+  if (code === 'MODEL_TIMEOUT_FIRST_EVENT') return '模型在 180 秒内未返回首个响应事件，历史已保留，可以继续当前任务。';
+  if (code === 'MODEL_TIMEOUT_IDLE') return '模型响应流连续 180 秒没有新事件，未执行未完成的工具调用，历史已保留。';
+  if (code === 'MODEL_TIMEOUT_TOTAL') return '模型单次响应达到 15 分钟上限，未执行未完成的工具调用，历史已保留。';
+  if (code === 'MODEL_TIMEOUT') return '模型响应超时，历史已保留，可以继续当前任务。';
+  if (code?.startsWith('COMPACTION_') || code?.startsWith('CONTEXT_')) return '上下文压缩未成功，原始历史和板卡资料已保留；请检查上下文容量后继续。';
+  if (code === 'MODEL_RESPONSE_INCOMPLETE' || code === 'MODEL_RESPONSE_ABORTED') return '模型响应未完整结束，未执行不完整工具参数；历史已保留。';
+  return `Agent 本次执行失败${code && /^[A-Z][A-Z0-9_]{1,100}$/.test(code) ? `（${code}）` : ''}，历史已保留。`;
+}
+
+export class Orchestrator {
+  private mainWindow: BrowserWindow;
+  private pushUI: PushUIFn;
+  private state: TaskStateMachine;
+  private buffer: ChatBuffer;
+  private currentTask: string | null = null;
+  private currentTaskId: string | null = null;
+  private currentConversationId: string | null = null;
+  private currentExecutionProfile: AgentExecutionProfile = 'default';
+  private currentModelSnapshot: EngineeringAgentModelSnapshot | null = null;
+  private currentRuntimeModel: EngineeringAgentRuntimeModel | null = null;
+  private currentExploreExpectation: ExploreAnalysisExpectation | null = null;
+  private activity: AgentActivity | null = null;
+  private currentExploreResult: ExploreAnalysisResult | null = null;
+  private currentSkillRefs: SkillReference[] = [];
+  private currentAttachments: AttachmentReference[] = [];
+  private invokedSkillIds = new Set<string>();
+  private skillEnforcementAttempt = 0;
+  private currentAgentTranscript = '';
+  private transcriptResponseId: string | null = null;
+  private contextUsage: AgentContextUsage | null = null;
+  private lastAgentError: string | null = null;
+  private currentAttempt = 0;
+  private observedAgentPid: number | null = null;
+  private queuedTasks: QueuedTask[] = [];
+  private pendingGuidance: AgentTaskInput[] = [];
+  private confirmableExplorePlans = new Map<string, ConfirmableExplorePlan>();
+  private currentUserTurns: string[] = [];
+  private turnInFlight = false;
+  private paused = false;
+  private silenceTimer: NodeJS.Timeout | null = null;
+  private turnStartedAt = 0;
+  private lastAgentOutputAt = 0;
+  private readonly maxValidationRetries = 2;
+
+  constructor(mainWindow: BrowserWindow, pushUI: PushUIFn) {
+    this.mainWindow = mainWindow;
+    this.pushUI = (channel, payload) => {
+      const routed = routeAgentUiEvent(this.currentExecutionProfile, channel, payload, this.currentExploreExpectation);
+      pushUI(routed.channel, routed.payload);
+    };
+    this.state = new TaskStateMachine();
+    this.buffer = new ChatBuffer();
+
+    this.state.setProgressCallback((steps) => {
+      logger.info('task:state', { phase: this.state.phase, steps });
+      this.pushUI('task:progress', { steps, taskId: this.currentTaskId });
+    });
+
+    logger.info('task:state', { phase: 'init', msg: 'Orchestrator created; Rig starts with the first configured task' });
+  }
+
+  submitTask(task: string | AgentTaskInput, mode: TaskSubmitMode = 'auto', conversationId?: string): TaskSubmitResult {
+    const input = normalizeAgentTaskInput(task);
+    const binding = bindActiveProject(input.text);
+    const targetConversationId = conversationId || listChatConversations().activeConversationId;
+    const request: QueuedTask = {
+      id: randomUUID(),
+      text: binding.text,
+      skillRefs: input.skillRefs,
+      attachments: input.attachments,
+      conversationId: targetConversationId,
+      executionProfile: 'default',
+      modelSnapshot: snapshotEngineeringAgentModel(),
+    };
+
+    return this.submitQueuedTask(request, mode);
+  }
+
+  submitExploreAnalysis(
+    value: unknown,
+    requestId = randomUUID(),
+    conversationId?: string,
+    sources: SourceEvidence[] = [],
+  ): TaskSubmitResult & { requestId: string } {
+    const request = normalizeExploreRequest(value);
+    const normalizedRequestId = requestId.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(normalizedRequestId)) throw new Error('Explore request id is invalid');
+    const selectedRequest: ExploreRequest = {
+      ...request,
+      context: { items: request.context.items.filter((item) => item.selected) },
+    };
+    const targetConversationId = conversationId || `explore:${normalizedRequestId}`;
+    const binding = bindActiveProject(this.buildExploreAnalysisPrompt(selectedRequest, normalizedRequestId, sources));
+    const queuedTask: QueuedTask = {
+      id: randomUUID(),
+      text: binding.text,
+      skillRefs: [],
+      attachments: [],
+      conversationId: targetConversationId,
+      executionProfile: 'explore_analysis',
+      modelSnapshot: snapshotEngineeringAgentModel(),
+      exploreExpectation: {
+        requestId: normalizedRequestId,
+        mode: selectedRequest.mode,
+        ...(sources.length ? { sourceUrls: sources.map((source) => source.url) } : {}),
+      },
+    };
+    const result = this.submitQueuedTask(queuedTask, this.getTaskStatus().busy ? 'queue' : 'auto');
+    return { ...result, requestId: normalizedRequestId };
+  }
+
+  submitExplorePlan(value: unknown, requestId = randomUUID(), conversationId?: string): TaskSubmitResult & { requestId: string } {
+    const handoff = normalizeHandoffContext(value);
+    const normalizedRequestId = requestId.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/.test(normalizedRequestId)) throw new Error('Explore plan request id is invalid');
+    const targetConversationId = conversationId || `explore:${normalizedRequestId}`;
+    const binding = bindActiveProject(this.buildExplorePlanPrompt(handoff, normalizedRequestId));
+    this.cleanupConfirmableExplorePlans();
+    this.confirmableExplorePlans.set(normalizedRequestId, {
+      handoff,
+      conversationId: targetConversationId,
+      projectId: binding.projectId,
+      createdAt: Date.now(),
+    });
+    const queuedTask: QueuedTask = {
+      id: randomUUID(),
+      text: binding.text,
+      skillRefs: [],
+      attachments: [],
+      conversationId: targetConversationId,
+      executionProfile: 'explore_plan',
+      modelSnapshot: snapshotEngineeringAgentModel(),
+      exploreExpectation: { requestId: normalizedRequestId, mode: 'plan' },
+    };
+    try {
+      const result = this.submitQueuedTask(queuedTask, this.getTaskStatus().busy ? 'queue' : 'auto');
+      return { ...result, requestId: normalizedRequestId };
+    } catch (error) {
+      this.confirmableExplorePlans.delete(normalizedRequestId);
+      throw error;
+    }
+  }
+
+  private activeEngineeringConversationId(): string {
+    return listChatConversations().activeConversationId;
+  }
+
+  confirmExploreExecution(value: unknown): TaskSubmitResult {
+    const confirmation = normalizeExploreExecutionConfirmRequest(value);
+    this.cleanupConfirmableExplorePlans();
+    const record = this.confirmableExplorePlans.get(confirmation.planRequestId);
+    if (!record) throw new Error('执行计划不存在或已过期，请重新生成计划');
+    if (record.handoff.id !== confirmation.handoffId) throw new Error('执行确认与当前 Handoff 不匹配');
+    if (!record.result || !record.completedAt) throw new Error('执行计划尚未完成，不能确认执行');
+    const activeProject = getActiveProject();
+    if (record.projectId && activeProject?.id !== record.projectId) throw new Error('执行计划属于其他工程，请切回原工程后重新生成计划');
+    if (record.usedAt) throw new Error('该执行计划已经确认过，不能重复执行');
+    if (Date.now() - record.completedAt > 30 * 60 * 1000) {
+      this.confirmableExplorePlans.delete(confirmation.planRequestId);
+      throw new Error('执行计划已过期，请重新生成计划');
+    }
+
+    const binding = bindActiveProject(this.buildExploreExecutionPrompt(record.handoff, record.result));
+    const queuedTask: QueuedTask = {
+      id: randomUUID(),
+      text: binding.text,
+      skillRefs: [],
+      attachments: [],
+      conversationId: this.activeEngineeringConversationId(),
+      executionProfile: 'default',
+      modelSnapshot: snapshotEngineeringAgentModel(),
+    };
+    const result = this.submitQueuedTask(queuedTask, this.getTaskStatus().busy ? 'queue' : 'auto');
+    record.usedAt = Date.now();
+    return result;
+  }
+  private submitQueuedTask(request: QueuedTask, mode: TaskSubmitMode): TaskSubmitResult {
+    const input: AgentTaskInput = { text: request.text, skillRefs: request.skillRefs, attachments: request.attachments };
+
+    if (this.currentTask || this.turnInFlight || this.paused) {
+      if (this.currentConversationId && this.currentConversationId !== request.conversationId) {
+        throw new Error('Agent 正在当前对话中工作，完成或停止后才能切换历史对话');
+      }
+      if (mode === 'queue') {
+        this.queuedTasks.push(request);
+        this.pushUI('chat:message', {
+          text: `[Worker] 已排队为下一任务（队列 ${this.queuedTasks.length}）`,
+          timestamp: Date.now(),
+          taskId: request.id,
+        });
+        this.emitTaskStatus();
+        return this.submitResult('queued', request.id);
+      }
+
+      if (!canAppendTaskGuidance(this.currentExecutionProfile || 'default', request.executionProfile)) {
+        throw new Error('受限 Explore 分析不接受跨档位追加要求，请排队为独立任务');
+      }
+
+      this.pendingGuidance.push(input);
+      this.pushUI('chat:message', {
+        text: `[Worker] 已追加到当前任务，将在当前执行步骤结束后继续处理（追加 ${this.pendingGuidance.length}）`,
+        timestamp: Date.now(),
+        taskId: this.currentTaskId,
+      });
+      this.emitTaskStatus();
+      return this.submitResult('guided', this.currentTaskId || request.id);
+    }
+
+    void this.startTask(request);
+    return this.submitResult('started', request.id);
+  }
+
+  async handleTask(task: string): Promise<void> {
+    this.submitTask(task, 'auto');
+  }
+
+  private async startTask(request: QueuedTask): Promise<void> {
+    this.currentTask = request.text;
+    this.currentTaskId = request.id;
+    this.currentConversationId = request.conversationId;
+    this.currentExecutionProfile = request.executionProfile;
+    this.currentModelSnapshot = request.modelSnapshot;
+    this.currentRuntimeModel = null;
+    this.lastAgentError = null;
+    if (request.executionProfile === 'default' && this.contextUsage?.contextWindow !== request.modelSnapshot.contextWindow) this.contextUsage = null;
+    this.currentExploreExpectation = request.exploreExpectation || null;
+    this.currentExploreResult = null;
+    this.currentSkillRefs = request.skillRefs;
+    this.currentAttachments = request.attachments || [];
+    this.invokedSkillIds = new Set();
+    this.skillEnforcementAttempt = 0;
+    this.currentAttempt = 0;
+    this.currentAgentTranscript = '';
+    this.currentUserTurns = [request.text];
+    this.paused = false;
+    this.emitTaskStatus();
+    try {
+      this.currentRuntimeModel = hydrateEngineeringAgentModel(request.modelSnapshot);
+      await this.runTask(request.text);
+    } catch (error) {
+      if (!this.isActiveTask(request.id)) {
+        logger.warn('task:error', { taskId: request.id, ignored: true, stage: 'start' });
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('task:error', { task: agentTextForLog(request.executionProfile, request.text), taskId: request.id, message });
+      this.pushUI('chat:message', {
+        text: `[Worker] 任务执行失败: ${message}`,
+        timestamp: Date.now(),
+        error: true,
+        taskId: request.id,
+      });
+      this.state.fail();
+      this.pushUI('task:complete', { code: 1, taskId: request.id });
+      this.finishCurrentTask();
+    }
+  }
+
+  private async runTask(task: string, continuation?: TaskContinuation): Promise<void> {
+    logger.info('task:start', {
+      task: agentTextForLog(this.currentExecutionProfile, task),
+      taskId: this.currentTaskId,
+      continuation: continuation?.kind,
+    });
+
+    if (!continuation) {
+      this.state.start(task);
+    }
+
+    let effectiveTask = task;
+    if (continuation?.kind === 'validation') {
+      effectiveTask = `${task}\n\n【上一版页面验收失败，必须修正后重新生成】\n${continuation.text}`;
+    } else if (continuation?.kind === 'guidance') {
+      effectiveTask = `${task}\n\n【用户在执行过程中追加的要求】\n${continuation.text}\n\n继续当前任务，不要把追加要求当成独立任务；检查已有工作并在完成后统一汇报。`;
+    } else if (continuation?.kind === 'resume') {
+      effectiveTask = `${task}\n\n【恢复此前暂停的任务】\n${continuation.text}`;
+    } else if (continuation?.kind === 'skill-enforcement') {
+      effectiveTask = `${task}\n\n【显式 Skill 调用校验未通过】\n${continuation.text}\n\n先补齐缺失的 Skill 工具调用，再复核已经完成的工作；不要忽略任何用户正文中的 @Skill。`;
+    }
+    const restricted = isRestrictedExploreProfile(this.currentExecutionProfile);
+    const sessionData = restricted
+      ? { session: { id: 'explore-analysis', turnCount: 0 }, text: '' }
+      : buildClaudeSessionContext(this.currentConversationId);
+    const contextData = restricted
+      ? { prompt: effectiveTask, skillsFound: [] as string[], explicitSkills: [] as string[], recommendedSkills: [] as string[] }
+      : buildContext(effectiveTask, this.currentSkillRefs.map((ref) => ref.id));
+    const attachmentContext = !restricted && this.currentConversationId
+      ? buildAttachmentPromptContext(this.currentConversationId, this.currentAttachments)
+      : '';
+    const promptWithHistory = restricted
+      ? contextData.prompt
+      : `${contextData.prompt}${attachmentContext ? `\n\n${attachmentContext}` : ''}`;
+    logger.info('task:context', {
+      profile: this.currentExecutionProfile,
+      skillsFound: contextData.skillsFound,
+      explicitSkills: contextData.explicitSkills,
+      recommendedSkills: contextData.recommendedSkills,
+      promptLength: promptWithHistory.length,
+      sessionId: sessionData.session.id,
+      sessionTurns: sessionData.session.turnCount,
+      sessionFile: restricted ? null : getClaudeSessionFile(),
+      promptPreview: restricted ? '[restricted explore request]' : promptWithHistory.slice(0, 500),
+    });
+
+    this.state.advanceTo('running');
+
+    const proc = this.ensurePersistentAgent(this.currentExecutionProfile, this.currentRuntimeModel, sessionData.text);
+    this.turnInFlight = true;
+    this.turnStartedAt = Date.now();
+    this.activity = null;
+    this.transcriptResponseId = null;
+    this.lastAgentOutputAt = this.turnStartedAt;
+    this.startSilenceTimer();
+
+    this.pushUI('chat:message', {
+      text: `[Agent] PID ${proc.pid}`,
+      timestamp: Date.now(),
+      kind: 'detail',
+      taskId: this.currentTaskId,
+    });
+    if (contextData.explicitSkills.length) {
+      this.pushUI('chat:message', {
+        text: `用户显式引用：${contextData.explicitSkills.map((id) => `@${id}`).join('、')}。Agent 必须全部加载。`,
+        timestamp: Date.now(),
+        kind: 'detail',
+        toolName: 'Skill',
+        taskId: this.currentTaskId,
+      });
+    }
+    if (contextData.recommendedSkills.length) {
+      this.pushUI('chat:message', {
+        text: `自动建议：${contextData.recommendedSkills.map((id) => `@${id}`).join('、')}。Agent 将按需加载。`,
+        timestamp: Date.now(),
+        kind: 'detail',
+        toolName: 'Skill',
+        taskId: this.currentTaskId,
+      });
+    }
+    if (!continuation) {
+      this.pushUI('chat:message', {
+        text: restricted
+          ? '[Worker] Explore 受限分析已启动：仅允许读取与结构化判断，不会修改文件或操作硬件。'
+          : this.describeExecutionPlan(task),
+        timestamp: Date.now(),
+        kind: 'progress',
+        taskId: this.currentTaskId,
+      });
+    }
+
+    sendAgentMessage(promptWithHistory, this.currentExecutionProfile, this.currentRuntimeModel ?? undefined, this.agentSessionBinding(this.currentExecutionProfile, sessionData.text));
+    this.emitTaskStatus();
+  }
+
+  private agentSessionBinding(profile: AgentExecutionProfile, bootstrap = ''): AgentSessionBinding {
+    const conversation = this.currentConversationId || 'engineering';
+    return { conversationId: isRestrictedExploreProfile(profile) ? `${conversation}:${this.currentTaskId}` : conversation, bootstrap };
+  }
+
+  private ensurePersistentAgent(profile: AgentExecutionProfile = 'default', model?: EngineeringAgentRuntimeModel | null, bootstrap = ''): NonNullable<ReturnType<typeof getAgentProcess>> {
+    const proc = ensureAgentProcess(profile, model ?? undefined, this.agentSessionBinding(profile, bootstrap));
+    if (this.observedAgentPid === proc.pid) {
+      return proc;
+    }
+
+    this.buffer = new ChatBuffer();
+    const outputDecoder = new StringDecoder('utf8');
+
+    proc.stdout?.on('data', (chunk: Buffer) => {
+      if (this.observedAgentPid !== (proc.pid ?? null)) return;
+      this.lastAgentOutputAt = Date.now();
+      const text = outputDecoder.write(chunk);
+      logger.info('agent:stdout', { profile, bytes: chunk.length });
+      const parsed = this.buffer.feed(text);
+      for (const p of parsed) {
+        logger.info('agent:parsed', {
+          type: p.type,
+          tool: p.toolName,
+          preview: p.type === 'thinking' ? '[provider reasoning]' : agentTextForLog(profile, p.content.slice(0, 200)),
+        });
+        this.handleParsedChunk(p, profile);
+      }
+    });
+
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      if (this.observedAgentPid !== (proc.pid ?? null)) return;
+      this.lastAgentOutputAt = Date.now();
+      const text = chunk.toString().trim();
+      if (text) {
+        logger.stderr(agentTextForLog(profile, text));
+        this.pushUI('chat:message', {
+          text: agentStderrForUI(profile, text),
+          timestamp: Date.now(),
+          kind: 'detail',
+          error: true,
+          taskId: this.currentTaskId,
+        });
+      }
+    });
+
+    proc.on('close', (code) => {
+      if (this.observedAgentPid !== (proc.pid ?? null)) return;
+      this.stopSilenceTimer();
+      this.observedAgentPid = null;
+      // A result event can start asynchronous page validation before the CLI
+      // process closes. In that window the turn is already complete, so the
+      // validation path remains the task owner and may respawn the Agent if it
+      // needs a follow-up turn.
+      if (this.turnInFlight) {
+        void this.handleAgentProcessExit(code ?? 1);
+      }
+    });
+
+    proc.on('error', (err) => {
+      if (this.observedAgentPid !== (proc.pid ?? null)) return;
+      logger.error('agent:error', { message: err.message, stack: err.stack });
+      this.pushUI('chat:message', {
+        text: `[Agent] 启动失败: ${err.message}`,
+        timestamp: Date.now(),
+        error: true,
+        taskId: this.currentTaskId,
+      });
+      this.state.fail();
+      this.turnInFlight = false;
+      this.finishCurrentTask();
+    });
+
+    this.observedAgentPid = proc.pid ?? null;
+    logger.info('agent:spawn', { pid: proc.pid, started: !!proc.pid, persistent: true });
+    return proc;
+  }
+
+  private async handleAgentTurnComplete(code: number, task: string): Promise<void> {
+    if (!this.turnInFlight) {
+      logger.warn('agent:turn-complete', { ignored: true, exitCode: code, task: task.slice(0, 100) });
+      return;
+    }
+    const taskId = this.currentTaskId;
+    if (!taskId) return;
+    this.turnInFlight = false;
+    logger.info('agent:turn-complete', {
+      exitCode: code,
+      taskId: this.currentTaskId,
+      task: agentTextForLog(this.currentExecutionProfile, task.slice(0, 100)),
+    });
+    const restricted = isRestrictedExploreProfile(this.currentExecutionProfile);
+
+    const remaining = this.buffer.flush();
+    for (const p of remaining) {
+      logger.info('agent:parsed', {
+        type: p.type,
+        tool: p.toolName,
+        preview: agentTextForLog(this.currentExecutionProfile, p.content.slice(0, 200)),
+      });
+      this.handleParsedChunk(p);
+    }
+
+    if (code === 0 && !restricted) {
+      const continued = await this.continueWithPendingGuidance(task);
+      if (!this.isActiveTask(taskId)) return;
+      if (continued) return;
+    }
+
+    if (code === 0 && !restricted && isHtmlGameTask(task)) {
+      const browserView = getBrowserView();
+      if (browserView) {
+        const validation = await validateCurrentPage(browserView, task);
+        // Stop, task failure, or a queue transition may happen while the
+        // screenshot/validation promise is pending. Never let that stale
+        // completion mutate or restart a newer task.
+        if (!this.isActiveTask(taskId)) return;
+        if (validation) {
+          logger.info('page:validate', {
+            ok: validation.ok,
+            reasons: validation.reasons,
+            screenshotPath: validation.screenshotPath,
+            url: validation.url,
+            title: validation.title,
+            metrics: validation.metrics,
+            attempt: this.currentAttempt,
+          });
+
+          this.pushUI('chat:message', {
+            text: `[Worker] 页面验收截图: ${validation.screenshotPath}`,
+            timestamp: Date.now(),
+            taskId: this.currentTaskId,
+          });
+
+          if (!validation.ok && this.currentAttempt < this.maxValidationRetries) {
+            this.currentAttempt += 1;
+            const feedback = [
+              `当前页面 URL: ${validation.url}`,
+              `标题: ${validation.title}`,
+              `验收失败原因: ${validation.reasons.join('；')}`,
+              `当前尺寸指标: widthRatio=${validation.metrics.widthRatio}, heightRatio=${validation.metrics.heightRatio}, areaRatio=${validation.metrics.areaRatio}`,
+              `失败截图: ${validation.screenshotPath}`,
+              '要求：直接修改并重新打开当前 HTML，直到页面铺满 BrowserView 且打开后不处于失败状态。',
+            ].join('\n');
+
+            this.pushUI('chat:message', {
+              text: `[Worker] 页面验收未通过，开始自动返工（第 ${this.currentAttempt} 次）`,
+              timestamp: Date.now(),
+              kind: 'progress',
+              error: true,
+              taskId: this.currentTaskId,
+            });
+
+            await this.runTask(task, { kind: 'validation', text: feedback });
+            return;
+          }
+
+          if (!validation.ok) {
+            const continued = await this.continueWithPendingGuidance(task);
+            if (!this.isActiveTask(taskId)) return;
+            if (continued) return;
+            this.pushUI('chat:message', {
+              text: `[Worker] 页面验收失败：${validation.reasons.join('；')}`,
+              timestamp: Date.now(),
+              error: true,
+              taskId: this.currentTaskId,
+            });
+            this.state.fail();
+            this.pushUI('task:complete', { code: 2, taskId: this.currentTaskId });
+            this.finishCurrentTask();
+            return;
+          }
+        }
+      }
+    }
+
+    // 页面验收本身可能耗时；验收期间收到的追加要求也必须留在当前任务内。
+    if (code === 0 && !restricted) {
+      const continued = await this.continueWithPendingGuidance(task);
+      if (!this.isActiveTask(taskId)) return;
+      if (continued) return;
+    }
+
+    if (code === 0 && restricted && !this.currentExploreResult) code = 4;
+
+    if (code === 0 && !restricted) {
+      const missingSkills = this.currentSkillRefs
+        .map((ref) => ref.id)
+        .filter((id, index, all) => all.indexOf(id) === index && !this.invokedSkillIds.has(id));
+      if (missingSkills.length && this.skillEnforcementAttempt < 1) {
+        this.skillEnforcementAttempt += 1;
+        this.pushUI('chat:message', {
+          text: `[Worker] 检测到显式 Skill 尚未全部调用，正在补齐：${missingSkills.map((id) => `@${id}`).join('、')}`,
+          timestamp: Date.now(),
+          kind: 'progress',
+          toolName: 'Skill',
+          taskId: this.currentTaskId,
+        });
+        await this.runTask(task, {
+          kind: 'skill-enforcement',
+          text: `尚未观察到这些 Skill 工具调用：${missingSkills.map((id) => `/${id}`).join('、')}。`,
+        });
+        return;
+      }
+      if (missingSkills.length) {
+        code = 3;
+        this.pushUI('chat:message', {
+          text: `[Worker] 显式 Skill 调用未完成：${missingSkills.map((id) => `@${id}`).join('、')}。任务不能标记为成功。`,
+          timestamp: Date.now(),
+          kind: 'conversation',
+          toolName: 'Skill',
+          error: true,
+          taskId: this.currentTaskId,
+        });
+      }
+    }
+
+    this.pushUI('chat:message', {
+      text: code === 0 ? '[Agent] 任务完成' : `[Agent] 任务失败 (code: ${code})`,
+      timestamp: Date.now(),
+      kind: 'status',
+      taskId: this.currentTaskId,
+    });
+
+    if (code === 0) {
+      this.state.complete();
+      logger.info('task:complete', { exitCode: code });
+      if (!restricted) {
+        appendClaudeSessionTurn({
+          user: this.currentUserTurns.join('\n\n追加要求：\n'),
+          assistant: this.currentAgentTranscript || '[Agent] 任务完成',
+          status: 'completed',
+        }, this.currentConversationId);
+      }
+    } else {
+      this.state.fail();
+      logger.error('task:complete', { exitCode: code, msg: 'Agent exited with error' });
+      if (!restricted) {
+        appendClaudeSessionTurn({
+          user: this.currentUserTurns.join('\n\n追加要求：\n'),
+          assistant: this.currentAgentTranscript || `[Agent] 任务失败 (code: ${code})`,
+          status: 'failed',
+        }, this.currentConversationId);
+        this.pushUI('chat:message', {
+          text: agentFailureMessage(this.lastAgentError),
+          timestamp: Date.now(),
+          error: true,
+          taskId: this.currentTaskId,
+        });
+      }
+    }
+
+    this.pushUI('task:complete', { code, taskId: this.currentTaskId });
+    this.finishCurrentTask();
+  }
+
+  private async continueWithPendingGuidance(task: string): Promise<boolean> {
+    if (isRestrictedExploreProfile(this.currentExecutionProfile)) {
+      throw new Error('受限 Explore 分析不接受执行中追加要求');
+    }
+    if (this.pendingGuidance.length === 0) return false;
+    const guidance = this.pendingGuidance.splice(0);
+    this.currentUserTurns.push(...guidance.map((entry) => entry.text));
+    const knownIds = new Set(this.currentSkillRefs.map((ref) => ref.id));
+    for (const entry of guidance) {
+      for (const ref of entry.skillRefs) {
+        if (knownIds.has(ref.id)) continue;
+        knownIds.add(ref.id);
+        this.currentSkillRefs.push(ref);
+      }
+      this.currentAttachments ||= [];
+      const knownAttachments = new Set(this.currentAttachments.map((item) => item.id));
+      for (const attachment of entry.attachments || []) {
+        if (knownAttachments.has(attachment.id)) continue;
+        knownAttachments.add(attachment.id);
+        this.currentAttachments.push(attachment);
+      }
+    }
+    this.pushUI('chat:message', {
+      text: `[Worker] 正在应用 ${guidance.length} 条追加要求，继续当前任务...`,
+      timestamp: Date.now(),
+      taskId: this.currentTaskId,
+    });
+    this.emitTaskStatus();
+    await this.runTask(task, { kind: 'guidance', text: guidance.map((entry, index) => `${index + 1}. ${entry.text}`).join('\n') });
+    return true;
+  }
+
+  private async handleAgentProcessExit(code: number): Promise<void> {
+    const taskId = this.currentTaskId;
+    const restricted = isRestrictedExploreProfile(this.currentExecutionProfile);
+    if (restricted && code === 0 && !this.currentExploreResult) code = 4;
+    if (restricted && code !== 0) {
+      this.pushUI('explore:analysis:error', {
+        mode: this.currentExecutionProfile === 'explore_plan' ? 'plan' : 'analysis',
+        requestId: this.currentExploreExpectation?.requestId,
+        message: this.currentExecutionProfile === 'explore_plan' ? 'Catnip 暂时无法生成执行计划' : 'Catnip 暂时无法完成探索分析',
+      });
+    }
+    logger.info('agent:close', { exitCode: code, taskId, queueLength: this.queuedTasks.length });
+    this.pushUI('chat:message', {
+      text: `[Agent] Rig 进程已退出 (code: ${code})`,
+      timestamp: Date.now(),
+      error: code !== 0,
+      taskId,
+    });
+    if (this.currentTask && !restricted) {
+      appendClaudeSessionTurn({
+        user: this.currentUserTurns.length
+          ? this.currentUserTurns.join('\n\n追加要求：\n')
+          : this.currentTask,
+        assistant: this.currentAgentTranscript || `[Agent] 进程退出 (code: ${code})`,
+        status: code === 0 ? 'completed' : 'failed',
+      }, this.currentConversationId);
+    }
+    if (code === 0) {
+      this.state.complete();
+    } else {
+      this.state.fail();
+    }
+    this.turnInFlight = false;
+    this.pushUI('task:complete', { code, taskId });
+    this.finishCurrentTask();
+  }
+
+  private handleParsedChunk(
+    p: ParsedChunk,
+    sourceProfile: AgentExecutionProfile = this.currentExecutionProfile,
+  ): void {
+    const restricted = isRestrictedExploreProfile(sourceProfile);
+    if (p.type === 'activity') {
+      if (!restricted && this.currentTaskId && p.activity) {
+        const now = Date.now();
+        this.activity = { ...p.activity, startedAt: now - p.activity.elapsedMs, lastEventAt: now };
+        this.emitTaskStatus();
+      }
+      return;
+    }
+    if (p.type === 'context') {
+      if (!restricted && this.currentTaskId && p.contextUsage) {
+        this.contextUsage = p.contextUsage;
+        this.emitTaskStatus();
+      }
+      return;
+    }
+    if (p.type === 'init') {
+      this.lastAgentError = null;
+      const failedMcp = p.mcpServers?.filter((server) => ['failed', 'needs-auth', 'disabled', 'blocked'].includes(server.status)) ?? [];
+      if (failedMcp.length > 0) {
+        const names = failedMcp.map((server) => server.name).join(', ');
+        logger.error('mcp:init', { failedMcp });
+        this.pushUI('chat:message', {
+          text: `[Worker] MCP 服务连接失败: ${names}`,
+          timestamp: Date.now(),
+          error: true,
+          taskId: this.currentTaskId,
+        });
+        this.state.fail();
+        killAgent();
+        this.observedAgentPid = null;
+        this.turnInFlight = false;
+        this.pushUI('task:complete', { code: 1, taskId: this.currentTaskId });
+        this.finishCurrentTask();
+        return;
+      }
+
+      logger.info('mcp:init', { mcpServers: p.mcpServers });
+      return;
+    }
+
+    if (p.type === 'thinking') {
+      if (!restricted && this.currentTaskId && p.content) {
+        this.pushUI('chat:message', {
+          id: `thinking:${this.currentTaskId}:${p.thinkingId ?? 'legacy'}`,
+          text: p.content,
+          timestamp: Date.now(),
+          kind: 'thinking',
+          taskId: this.currentTaskId,
+        });
+      }
+      return;
+    }
+
+    if (p.type === 'result') {
+      const task = this.currentTask;
+      if (restricted) {
+        if (!task || !this.currentTaskId) return;
+        if (p.isError || !this.currentExploreExpectation || this.currentExploreResult) {
+          this.failExploreAnalysis('EXPLORE_RESULT_INVALID');
+          return;
+        }
+        try {
+          const result = p.structuredOutput === undefined
+            ? parseExploreAnalysisResultText(p.content, this.currentExploreExpectation)
+            : normalizeExploreAnalysisResult(p.structuredOutput, this.currentExploreExpectation);
+          this.currentExploreResult = result;
+          if (result.mode === 'plan') this.markExplorePlanReady(result);
+          this.pushUI('explore:analysis:result', result);
+        } catch {
+          this.failExploreAnalysis('EXPLORE_RESULT_INVALID');
+          return;
+        }
+        const taskId = this.currentTaskId;
+        void this.handleAgentTurnComplete(0, task).catch((error) => {
+          this.handleTurnFailure(error, taskId);
+        });
+        return;
+      }
+      if (p.isError && p.content) {
+        this.currentAgentTranscript += `${p.content}\n`;
+        this.lastAgentError = p.content;
+        this.pushUI('chat:message', {
+          text: p.content,
+          timestamp: Date.now(),
+          error: true,
+          taskId: this.currentTaskId,
+        });
+      }
+      if (task) {
+        const taskId = this.currentTaskId;
+        void this.handleAgentTurnComplete(p.isError ? 1 : 0, task).catch((error) => {
+          this.handleTurnFailure(error, taskId);
+        });
+      }
+      return;
+    }
+
+    if (restricted) {
+      if (p.type === 'tool_call' && p.toolName && !isExploreToolAllowed(sourceProfile, p.toolName)) {
+        this.failExploreAnalysis('EXPLORE_FORBIDDEN_TOOL');
+      }
+      return;
+    }
+
+    if (p.type === 'tool_call' && p.toolName) {
+      const now = Date.now();
+      this.activity = { requestId: this.activity?.requestId ?? 0, phase: 'tool', toolLabel: agentToolActivityLabel(p.toolName, p.toolInput), startedAt: now, lastEventAt: now, elapsedMs: 0, events: 0, textBytes: 0, reasoningBytes: 0, argumentBytes: 0 };
+      this.emitTaskStatus();
+    } else if (p.type === 'tool_result') {
+      this.activity = null;
+      this.emitTaskStatus();
+    }
+    const isError = p.type === 'error' || Boolean(p.isError);
+    const isExecutionDetail = p.type === 'tool_call' || p.type === 'tool_result' || p.type === 'system';
+    const streamId = p.type === 'text' ? normalizeResponseStreamId(p.textId) : undefined;
+    if (p.content && !isExecutionDetail) {
+      if (streamId) {
+        if (this.transcriptResponseId !== streamId && this.currentAgentTranscript) this.currentAgentTranscript += '\n\n';
+        this.currentAgentTranscript += p.content;
+        this.transcriptResponseId = streamId;
+      } else {
+        this.currentAgentTranscript += `${p.content}\n`;
+        this.transcriptResponseId = null;
+      }
+    }
+
+    logger.debug('ui:push', { channel: 'chat:message', type: p.type, tool: p.toolName, content: p.content.slice(0, 300) });
+    this.pushUI('chat:message', {
+      ...(streamId && this.currentTaskId ? { id: `response:${this.currentTaskId}:${streamId}`, streamId } : {}),
+      text: p.content,
+      timestamp: Date.now(),
+      kind: isExecutionDetail ? 'detail' : 'conversation',
+      toolName: p.toolName,
+      error: isError,
+      taskId: this.currentTaskId,
+    });
+
+    if (p.type === 'tool_call' && p.toolName) {
+      const tool = p.toolName;
+      if (tool === 'Skill') {
+        const input = p.toolInput && typeof p.toolInput === 'object' && !Array.isArray(p.toolInput)
+          ? p.toolInput as Record<string, unknown>
+          : {};
+        const value = [input.skill, input.name, input.command].find((candidate) => typeof candidate === 'string') as string | undefined;
+        const id = value?.trim().replace(/^\/|^@/, '');
+        if (id) this.invokedSkillIds.add(id);
+      }
+      if (tool.includes('navigate') || tool.includes('goto')) {
+        this.state.advanceTo('navigating');
+      } else if (tool.includes('extract')) {
+        this.state.advanceTo('extracting');
+      } else if (tool.includes('save')) {
+        this.state.advanceTo('cleaning');
+      }
+    }
+  }
+
+  private startSilenceTimer(): void {
+    if (this.silenceTimer) return;
+    this.silenceTimer = setInterval(() => {
+      if (!this.currentTask || !this.turnInFlight) return;
+      const now = Date.now();
+      if (now - this.lastAgentOutputAt < 5000) return;
+      const seconds = Math.floor((now - this.turnStartedAt) / 1000);
+      this.lastAgentOutputAt = now;
+      this.pushUI('chat:message', {
+        text: `[Agent] 仍在执行，等待输出... ${seconds}s`,
+        timestamp: now,
+        kind: 'status',
+        taskId: this.currentTaskId,
+      });
+      logger.info('agent:silence', {
+        seconds,
+        task: agentTextForLog(this.currentExecutionProfile, this.currentTask.slice(0, 100)),
+      });
+    }, 1000);
+  }
+
+  private stopSilenceTimer(): void {
+    if (!this.silenceTimer) return;
+    clearInterval(this.silenceTimer);
+    this.silenceTimer = null;
+  }
+
+  getTaskStatus(): {
+    busy: boolean;
+    paused: boolean;
+    activeTaskId: string | null;
+    activeTask: string | null;
+    queueLength: number;
+    guidanceCount: number;
+    contextUsage?: AgentContextUsage | null;
+    activity?: AgentActivity | null;
+  } {
+    return {
+      busy: Boolean(this.currentTask || this.turnInFlight || this.paused),
+      paused: this.paused,
+      activeTaskId: this.currentTaskId,
+      activeTask: this.currentTask,
+      queueLength: this.queuedTasks.length,
+      guidanceCount: this.pendingGuidance.length,
+      contextUsage: this.contextUsage ?? null,
+      activity: this.activity ?? null,
+    };
+  }
+
+  resetAgentConversation(): void {
+    if (this.getTaskStatus().busy) {
+      throw new Error('Agent 正在工作，完成或停止后才能切换历史对话');
+    }
+    this.observedAgentPid = null;
+    this.buffer = new ChatBuffer();
+    killAgent();
+    this.contextUsage = null;
+    this.activity = null;
+    this.lastAgentError = null;
+    this.emitTaskStatus();
+    logger.info('claude:session', { event: 'conversation-agent-reset' });
+  }
+
+  private submitResult(disposition: TaskSubmitResult['disposition'], taskId: string): TaskSubmitResult {
+    const status = this.getTaskStatus();
+    return {
+      ok: true,
+      disposition,
+      taskId,
+      activeTaskId: status.activeTaskId,
+      queueLength: status.queueLength,
+      guidanceCount: status.guidanceCount,
+    };
+  }
+
+  private emitTaskStatus(): void {
+    this.pushUI('task:status', this.getTaskStatus());
+  }
+
+  private handleTurnFailure(error: unknown, taskId: string | null = this.currentTaskId): void {
+    if (!taskId || !this.isActiveTask(taskId)) {
+      logger.warn('task:error', { taskId, ignored: true, stage: 'turn-complete' });
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (isRestrictedExploreProfile(this.currentExecutionProfile)) {
+      this.pushUI('explore:analysis:error', {
+        mode: this.currentExecutionProfile === 'explore_plan' ? 'plan' : 'analysis',
+        requestId: this.currentExploreExpectation?.requestId,
+        message: this.currentExecutionProfile === 'explore_plan' ? 'Catnip 暂时无法生成执行计划' : 'Catnip 暂时无法完成探索分析',
+      });
+    }
+    logger.error('task:error', { taskId: this.currentTaskId, stage: 'turn-complete', message });
+    this.pushUI('chat:message', {
+      text: `[Worker] 当前执行步骤失败: ${message}`,
+      timestamp: Date.now(),
+      error: true,
+      taskId: this.currentTaskId,
+    });
+    this.state.fail();
+    this.turnInFlight = false;
+    this.pushUI('task:complete', { code: 1, taskId: this.currentTaskId });
+    this.finishCurrentTask();
+  }
+
+  private failExploreAnalysis(code: 'EXPLORE_FORBIDDEN_TOOL' | 'EXPLORE_RESULT_INVALID'): void {
+    if (!isRestrictedExploreProfile(this.currentExecutionProfile) || !this.currentTaskId) return;
+    killAgent();
+    this.observedAgentPid = null;
+    this.handleTurnFailure(new Error(code), this.currentTaskId);
+  }
+
+  private finishCurrentTask(): void {
+    this.activity = null;
+    this.stopSilenceTimer();
+    this.currentTask = null;
+    this.currentTaskId = null;
+    this.currentConversationId = null;
+    this.currentExecutionProfile = 'default';
+    this.currentModelSnapshot = null;
+    this.currentRuntimeModel = null;
+    this.currentExploreExpectation = null;
+    this.currentExploreResult = null;
+    this.currentSkillRefs = [];
+    this.currentAttachments = [];
+    this.invokedSkillIds = new Set();
+    this.skillEnforcementAttempt = 0;
+    this.currentAgentTranscript = '';
+    this.currentAttempt = 0;
+    this.currentUserTurns = [];
+    this.pendingGuidance = [];
+    this.turnInFlight = false;
+    this.paused = false;
+
+    const next = this.queuedTasks.shift();
+    if (next) {
+      this.pushUI('chat:message', {
+        text: `[Worker] 开始执行下一条排队任务（剩余 ${this.queuedTasks.length}）`,
+        timestamp: Date.now(),
+        taskId: next.id,
+      });
+      void this.startTask(next);
+    } else {
+      this.emitTaskStatus();
+    }
+  }
+
+  private isActiveTask(taskId: string): boolean {
+    return this.currentTaskId === taskId && this.currentTask !== null;
+  }
+
+  private describeExecutionPlan(task: string): string {
+    if (isHtmlGameTask(task)) {
+      const shouldNotOpen = /(不要打开|先不打开|不用打开|别打开|只写|先写)/i.test(task);
+      return [
+        '[Worker] 执行计划',
+        '1. 先在工作区创建可运行 HTML 骨架，让文件尽早落地。',
+        '2. 分阶段补游戏逻辑、界面和操作控制，工具调用会逐条显示。',
+        shouldNotOpen
+          ? '3. 本轮按要求不打开、不截图，只汇报文件路径。'
+          : '3. 打开到右侧 BrowserView 截图验收，发现显示问题就继续修。',
+      ].join('\n');
+    }
+
+    if (taskWantsBrowser(task)) {
+      return '[Worker] 执行计划\n1. 定位目标文件或页面。\n2. 打开到右侧 BrowserView。\n3. 截图或读取状态确认结果。';
+    }
+
+    return '[Worker] 执行计划\n1. 读取必要上下文。\n2. 执行修改或工具操作。\n3. 汇报关键结果。';
+  }
+
+  private buildExploreAnalysisPrompt(request: ExploreRequest, requestId: string, sources: SourceEvidence[] = []): string {
+    const outputShape = request.mode === 'idea'
+      ? '{"schemaVersion":1,"requestId":"<same requestId>","mode":"idea","ideas":[IdeaResult]}'
+      : '{"schemaVersion":1,"requestId":"<same requestId>","mode":"diagnosis","diagnosis":DiagnosisResult}';
+    return [
+      '你正在执行 Catnip Forge Explore 只分析任务。',
+      '只能依据下方已选择 Context 形成判断；不得修改文件、执行命令、操作浏览器、Build、Flash、Serial 或调用 Runtime MCP。',
+      '最终单独调用 StructuredOutput 提交一个符合 schema 的 JSON 对象，不输出 Markdown 围栏或前后说明。',
+      `requestId 必须原样返回：${requestId}`,
+      `输出结构：${outputShape}`,
+      'idea 模式只返回 3 个差异明确、按可实现性排序的 Idea；每个 Idea 只选择 1–2 条最能支撑它的来源。',
+      '保持简洁，不要在思考或输出中重复罗列全部来源正文。',
+      'IdeaResult 字段固定为 id、title、value、implementationDirection、compatibility、sources；不得改用 summary、approach、feasibility 等近义字段。',
+      '来源对象必须逐项复用“已校验来源”中提供的 type、title、author（如有）、url、excerpt，不得生成新 URL 或改写 URL。',
+      `请求：${JSON.stringify(request)}`,
+      `已校验来源：${JSON.stringify(sources)}`,
+    ].join('\n');
+  }
+
+  private cleanupConfirmableExplorePlans(now = Date.now()): void {
+    this.confirmableExplorePlans ||= new Map<string, ConfirmableExplorePlan>();
+    for (const [requestId, record] of this.confirmableExplorePlans) {
+      const referenceTime = record.completedAt || record.createdAt;
+      const lifetime = record.completedAt ? 30 * 60 * 1000 : 2 * 60 * 60 * 1000;
+      if (record.usedAt || now - referenceTime > lifetime) this.confirmableExplorePlans.delete(requestId);
+    }
+  }
+
+  private markExplorePlanReady(result: ExplorePlanResult): void {
+    const record = this.confirmableExplorePlans.get(result.requestId);
+    if (!record) throw new Error('Explore plan result has no matching handoff');
+    record.result = structuredClone(result);
+    record.completedAt = Date.now();
+  }
+
+  private buildExploreExecutionPrompt(handoff: HandoffContext, result: ExplorePlanResult): string {
+    return [
+      '用户已在 Catnip Forge Explore 中明确确认执行下方计划。',
+      '先核对当前工作区真实状态，再按计划实施；不得把计划文本本身当作完成证据。',
+      '源码修改、Build、Flash、Serial 和实际验证必须分别依据真实结果汇报；没有设备或实机证据时明确标记 REAL_HARDWARE_VALIDATION_PENDING。',
+      '遵守现有工程规则和工具边界，不扩大到 Handoff 之外的目标。',
+      `Handoff：${JSON.stringify({ ...handoff, status: 'executing' })}`,
+      `已确认计划：${JSON.stringify(result.plan)}`,
+    ].join('\n');
+  }
+
+  private buildExplorePlanPrompt(handoff: HandoffContext, requestId: string): string {
+    return [
+      '你正在执行 Catnip Forge Explore 只计划任务。',
+      '只能依据下方 Handoff 生成计划；只允许调用 StructuredOutput 提交计划，不得调用其他工具、修改文件、执行命令、Build、Flash、Serial 或操作硬件。',
+      '最终单独调用 StructuredOutput 提交一个符合 schema 的 JSON 对象，不输出 Markdown 围栏或前后说明。',
+      `requestId 必须原样返回：${requestId}`,
+      '输出结构：{"schemaVersion":1,"requestId":"<same requestId>","mode":"plan","plan":{"summary":"...","steps":[{"id":"...","title":"...","detail":"..."}],"risks":["..."]}}',
+      `Handoff：${JSON.stringify(handoff)}`,
+    ].join('\n');
+  }
+
+  pause(): void {
+    logger.info('task:state', { action: 'pause' });
+    if (!this.currentTask) return;
+    killAgent();
+    this.observedAgentPid = null;
+    this.turnInFlight = false;
+    this.paused = true;
+    this.pushUI('chat:message', {
+      text: '[Worker] 任务已暂停',
+      timestamp: Date.now(),
+      taskId: this.currentTaskId,
+    });
+    this.emitTaskStatus();
+  }
+
+  resume(): void {
+    logger.info('task:state', { action: 'resume', task: this.currentTask?.slice(0, 100) });
+    if (!this.currentTask || !this.paused) return;
+    this.paused = false;
+    this.pushUI('chat:message', {
+      text: '[Worker] 恢复任务...',
+      timestamp: Date.now(),
+      taskId: this.currentTaskId,
+    });
+    const taskId = this.currentTaskId;
+    void this.runTask(this.currentTask, { kind: 'resume', text: '继续暂停前尚未完成的工作，并结合此前已经产生的结果。' }).catch((error) => {
+      if (!taskId || !this.isActiveTask(taskId)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      this.pushUI('chat:message', { text: `[Worker] 恢复失败: ${message}`, timestamp: Date.now(), error: true, taskId: this.currentTaskId });
+      this.state.fail();
+      this.finishCurrentTask();
+    });
+  }
+
+  stop(): void {
+    logger.info('task:state', { action: 'stop' });
+    const stoppedTaskId = this.currentTaskId;
+    if (this.currentTask && !isRestrictedExploreProfile(this.currentExecutionProfile)) {
+      appendClaudeSessionTurn({
+        user: this.currentUserTurns.length ? this.currentUserTurns.join('\n\n追加要求：\n') : this.currentTask,
+        assistant: this.currentAgentTranscript || '[Worker] 任务已停止',
+        status: 'interrupted',
+      }, this.currentConversationId);
+    }
+    killAgent();
+    this.observedAgentPid = null;
+    this.state.reset();
+    this.queuedTasks = [];
+    this.pushUI('chat:message', {
+      text: '[Worker] 任务已停止',
+      timestamp: Date.now(),
+      taskId: stoppedTaskId,
+    });
+    this.finishCurrentTask();
+  }
+
+  navigateBrowser(url: string): void {
+    logger.info('browser:navigate', { url });
+    loadURL(url);
+  }
+
+  getBrowserState(): { url: string; title: string } {
+    const bv = getBrowserView();
+    if (!bv) {
+      logger.warn('browser:state', { error: 'BrowserView not available' });
+      return { url: '', title: '' };
+    }
+    const state = {
+      url: bv.webContents.getURL(),
+      title: bv.webContents.getTitle(),
+    };
+    logger.info('browser:state', state);
+    return state;
+  }
+}

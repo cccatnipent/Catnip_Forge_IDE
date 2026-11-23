@@ -1,0 +1,35 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const ts = require('typescript');
+const React = require('react');
+const { renderToStaticMarkup } = require('react-dom/server');
+const { normalizeAgentContextUsage } = require('../dist/common/agent-context');
+const { normalizeModelConfig, createDefaultModelConfig, rigContextBudget } = require('../dist/common/model-config');
+const { ChatBuffer } = require('../dist/main/worker/chat-buffer');
+const usage = { contextWindow: 1000000, usedTokens: 125000, remainingTokens: 875000, reserveTokens: 80000, maxOutputTokens: 32768, protectedTokens: 2000, compactionCount: 2, phase: 'compacted', measurement: 'provider', providerInputTokens: 123000, providerOutputTokens: 2000 };
+assert.deepEqual(normalizeAgentContextUsage({ ...usage, secret: 'must-not-forward' }), usage);
+for (const invalid of [{ ...usage, usedTokens: -1 }, { ...usage, remainingTokens: 12 }, { ...usage, phase: 'arbitrary-provider-message' }, { ...usage, contextWindow: 3000000 }, { ...usage, providerInputTokens: Infinity }]) assert.equal(normalizeAgentContextUsage(invalid), null);
+const buffer = new ChatBuffer();
+const chunks = buffer.feed(JSON.stringify({ type: 'system', subtype: 'context_usage', context: usage }) + '\n');
+assert.equal(chunks.length, 1); assert.equal(chunks[0].type, 'context'); assert.equal(chunks[0].content, ''); assert.deepEqual(chunks[0].contextUsage, usage);
+assert.equal(buffer.feed(JSON.stringify({ type: 'system', subtype: 'context_usage', context: { ...usage, remainingTokens: -1 } }) + '\n').length, 0);
+const defaults = createDefaultModelConfig();
+assert.equal(rigContextBudget(defaults.providers[0]).contextWindow, 1000000);
+for (const limit of [0, NaN, 16383, 2000001, '1000000']) {
+  const invalid = structuredClone(defaults); invalid.providers[0].claudeCode.contextWindow = limit;
+  assert.throws(() => normalizeModelConfig(invalid));
+}
+const minimal = structuredClone(defaults); minimal.providers[0].claudeCode.contextWindow = 16384; minimal.providers[0].claudeCode.maxOutputTokens = 4096;
+assert.equal(rigContextBudget(normalizeModelConfig(minimal).providers[0]).reserveTokens, 8192);
+const sourceFile = path.join(__dirname, '..', 'src', 'renderer', 'components', 'ContextRing.tsx');
+const compiled = ts.transpileModule(fs.readFileSync(sourceFile, 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.React, esModuleInterop: true } }).outputText;
+const moduleResult = { exports: {} }; new Function('require', 'module', 'exports', compiled)(require, moduleResult, moduleResult.exports);
+const ContextRing = moduleResult.exports.default;
+const measured = renderToStaticMarkup(React.createElement(ContextRing, { usage }));
+assert.match(measured, /剩余 87%/); assert.match(measured, /剩余 875K \/ 1M/); assert.match(measured, /87.5 100/); assert.match(measured, /已自动压缩 2 次/);
+const unknown = renderToStaticMarkup(React.createElement(ContextRing, { capacity: 1000000 }));
+assert.match(unknown, /首次请求后计量/); assert.doesNotMatch(unknown, /100%/);
+assert.match(renderToStaticMarkup(React.createElement(ContextRing, { usage: { ...usage, phase: 'compacting' } })), /正在压缩历史/);
+assert.match(renderToStaticMarkup(React.createElement(ContextRing, { usage: { ...usage, phase: 'failed' } })), /压缩失败，历史已保留/);
+console.log('Context usage passed: validated counters, no arbitrary fields, typed Worker chunks, model bounds, real React circular remaining/unknown/compaction render.');

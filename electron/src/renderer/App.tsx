@@ -1,0 +1,1091 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import ChatPanel from './components/ChatPanel';
+import BrowserPanel from './components/BrowserPanel';
+import CatnipOnboarding from './components/CatnipOnboarding';
+import MarkdownContent from './components/MarkdownContent';
+import catnipForgeIcon from './assets/liukanshan-app-icon.png';
+import catnipAssistantImage from './assets/liukanshan-assistant.png';
+import liukanshanAvatarImage from './assets/liukanshan-avatar.jpg';
+import githubMarkImage from './assets/github-mark.png';
+import type { AgentTaskInput, AgentTaskStatus, BrowserTab, ChatConversation, ChatConversationSummary, ChatMessage, ChatMessageKind, HardboardDevice, ProjectSessionStatus, RecordingSummary, SoftwareAssistantMessage, StartupStatus, TaskStep, TaskSubmitMode, WorkbenchOverview } from './types';
+import type { BoardInfoSummary } from '../common/board-info';
+import { normalizeResponseStreamId, upsertChatMessage } from '../common/chat-stream';
+
+const LEFT_PANEL_WIDTH_KEY = 'vibeide.ui.leftPanelWidth';
+const APPEARANCE_POSITION_KEY = 'vibeide.appearance.position';
+const ASSISTANT_SIZE_KEY = 'vibeide.assistant.size';
+const DEFAULT_LEFT_PANEL_WIDTH = 34;
+const DEFAULT_ASSISTANT_SIZE = 144;
+const MIN_ASSISTANT_SIZE = 96;
+const MAX_ASSISTANT_SIZE = 208;
+const ASSISTANT_SIZE_STEP = 16;
+const APPEARANCE_EDGE_GAP = 12;
+const AUTHOR_GITHUB_URL = 'https://github.com/NeilBaumanMax';
+const ONBOARDING_SMOKE_MODE = new URLSearchParams(window.location.search).has('onboardingSmoke');
+const IDLE_TASK_STATUS: AgentTaskStatus = { busy: false, paused: false, activeTaskId: null, activeTask: null, queueLength: 0, guidanceCount: 0 };
+const ASSISTANT_WELCOME: SoftwareAssistantMessage = {
+  id: 'welcome',
+  role: 'assistant',
+  content: '你好，我是 **刘看山**。关于 Catnip Forge 的模型配置与切换、探索/知乎连接、Skill 小站、编译、烧录、串口或其他界面问题，都可以直接问我。',
+};
+type FloatingPosition = { x: number; y: number };
+
+function cleanAgentText(value: string): string {
+  return value
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001A\u001C-\u001F\u007F]/g, '')
+    .trim();
+}
+
+function inferChatMessageKind(text: string, provided?: ChatMessageKind, error = false): ChatMessageKind {
+  if (provided) return provided;
+  // Unclassified worker failures need to remain visible as conversational output.
+  // Typed tool failures are already marked as `detail` by the main process.
+  if (error) return 'conversation';
+  if (/^\[Agent\] 仍在执行，等待输出/.test(text)) return 'status';
+  if (/^\[Agent\] PID\b|^\s*•\s+(?:Tool|Read|Ran|Edited|Created)|^\s*└|^\{"type":"/.test(text)) return 'detail';
+  if (/^\[(?:Worker|Agent)\]/.test(text)) return 'progress';
+  return 'conversation';
+}
+
+document.documentElement.dataset.theme = 'dark';
+document.documentElement.style.colorScheme = 'dark';
+try {
+  window.localStorage.removeItem('vibeide.appearance.theme');
+} catch {
+  // A fixed dark theme does not depend on storage availability.
+}
+
+function clampAssistantSize(value: number): number {
+  return Math.min(MAX_ASSISTANT_SIZE, Math.max(MIN_ASSISTANT_SIZE, value));
+}
+
+function readInitialAssistantSize(): number {
+  try {
+    const stored = Number(window.localStorage.getItem(ASSISTANT_SIZE_KEY));
+    return Number.isFinite(stored) && stored > 0 ? clampAssistantSize(stored) : DEFAULT_ASSISTANT_SIZE;
+  } catch {
+    return DEFAULT_ASSISTANT_SIZE;
+  }
+}
+
+const INITIAL_ASSISTANT_SIZE = readInitialAssistantSize();
+
+function clampAppearancePosition(position: FloatingPosition, size = INITIAL_ASSISTANT_SIZE): FloatingPosition {
+  return {
+    x: Math.min(
+      Math.max(APPEARANCE_EDGE_GAP, window.innerWidth - size - APPEARANCE_EDGE_GAP),
+      Math.max(APPEARANCE_EDGE_GAP, position.x),
+    ),
+    y: Math.min(
+      Math.max(APPEARANCE_EDGE_GAP, window.innerHeight - size - APPEARANCE_EDGE_GAP),
+      Math.max(APPEARANCE_EDGE_GAP, position.y),
+    ),
+  };
+}
+
+function readInitialAppearancePosition(): FloatingPosition {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(APPEARANCE_POSITION_KEY) ?? 'null') as Partial<FloatingPosition> | null;
+    if (stored && Number.isFinite(stored.x) && Number.isFinite(stored.y)) {
+      return clampAppearancePosition({ x: Number(stored.x), y: Number(stored.y) });
+    }
+  } catch {
+    // Fall through to the collision-free default position.
+  }
+  return clampAppearancePosition({
+    x: window.innerWidth - INITIAL_ASSISTANT_SIZE - 18,
+    y: window.innerHeight - INITIAL_ASSISTANT_SIZE - 18,
+  });
+}
+
+function storeAppearancePosition(position: FloatingPosition): void {
+  try {
+    window.localStorage.setItem(APPEARANCE_POSITION_KEY, JSON.stringify(position));
+  } catch {
+    // Dragging remains available for this session when storage is unavailable.
+  }
+}
+
+function storeAssistantSize(size: number): void {
+  try {
+    window.localStorage.setItem(ASSISTANT_SIZE_KEY, String(size));
+  } catch {
+    // Resizing remains available for this session when storage is unavailable.
+  }
+}
+
+function clampLeftPanelWidth(value: number): number {
+  return Math.min(52, Math.max(24, value));
+}
+
+function readLeftPanelWidth(): number {
+  const stored = Number(window.localStorage.getItem(LEFT_PANEL_WIDTH_KEY));
+  return Number.isFinite(stored) && stored > 0
+    ? clampLeftPanelWidth(stored)
+    : DEFAULT_LEFT_PANEL_WIDTH;
+}
+
+export default function App() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatConversations, setChatConversations] = useState<ChatConversationSummary[]>([]);
+  const [activeConversationId, setActiveConversationId] = useState('');
+  const [chatHistoryError, setChatHistoryError] = useState('');
+  const [steps, setSteps] = useState<TaskStep[]>([]);
+  const [taskStatus, setTaskStatus] = useState<AgentTaskStatus>(IDLE_TASK_STATUS);
+  const [browserUrl, setBrowserUrl] = useState('about:blank');
+  const [tabs, setTabs] = useState<BrowserTab[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSummary, setRecordingSummary] = useState('未开始录制');
+  const [activeRecordingName, setActiveRecordingName] = useState('');
+  const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
+  const [hardboardDevices, setHardboardDevices] = useState<HardboardDevice[]>([]);
+  const [workbench, setWorkbench] = useState<WorkbenchOverview | null>(null);
+  const [leftPanelWidth, setLeftPanelWidth] = useState(readLeftPanelWidth);
+  const [leftPanelCollapsed, setLeftPanelCollapsed] = useState(false);
+  const [appearanceMenuOpen, setAppearanceMenuOpen] = useState(false);
+  const [appearancePosition, setAppearancePosition] = useState<FloatingPosition>(readInitialAppearancePosition);
+  const [assistantSize, setAssistantSize] = useState(INITIAL_ASSISTANT_SIZE);
+  const [appearanceDragging, setAppearanceDragging] = useState(false);
+  const [softwareAssistantMessages, setSoftwareAssistantMessages] = useState<SoftwareAssistantMessage[]>([ASSISTANT_WELCOME]);
+  const [softwareAssistantInput, setSoftwareAssistantInput] = useState('');
+  const [softwareAssistantPending, setSoftwareAssistantPending] = useState(false);
+  const [startupStatus, setStartupStatus] = useState<StartupStatus | null>(null);
+  const [startupApiKeyError, setStartupApiKeyError] = useState('');
+  const [startupApiKeySaving, setStartupApiKeySaving] = useState(false);
+  const [startupApiKeyRestarting, setStartupApiKeyRestarting] = useState(false);
+  const [startupUseCustomProvider, setStartupUseCustomProvider] = useState(false);
+  const [projectSession, setProjectSession] = useState<ProjectSessionStatus | null>(null);
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [selectedProjectId, setSelectedProjectId] = useState('');
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectBoardInfo, setNewProjectBoardInfo] = useState<BoardInfoSummary | null>(null);
+  const [boardInfoPicking, setBoardInfoPicking] = useState(false);
+  const [projectSessionError, setProjectSessionError] = useState('');
+  const [projectSessionSaving, setProjectSessionSaving] = useState(false);
+  const [onboardingStartRequest, setOnboardingStartRequest] = useState(0);
+  const workbenchSmokeTriggered = useRef(false);
+  const activeConversationIdRef = useRef('');
+  const appearanceSettingsRef = useRef<HTMLDivElement>(null);
+  const softwareAssistantMessagesRef = useRef<HTMLDivElement>(null);
+  const appearanceDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressAppearanceClickRef = useRef(false);
+
+  useEffect(() => {
+    window.localStorage.setItem(LEFT_PANEL_WIDTH_KEY, String(leftPanelWidth));
+  }, [leftPanelWidth]);
+
+  useEffect(() => {
+    void window.electronAPI?.getStartupStatus?.().then((status) => setStartupStatus(status));
+    void window.electronAPI?.getProjectSessionStatus?.().then((status) => {
+      setProjectSession(status);
+      setSelectedProjectId(status.suggestedProjectId || status.projects[0]?.id || '');
+      setProjectPickerOpen(!status.activeProject);
+    }).catch((error) => {
+      setProjectSessionError(error instanceof Error ? error.message : String(error));
+      setProjectPickerOpen(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    const refreshStartup = () => { void window.electronAPI?.getStartupStatus?.().then((status) => setStartupStatus(status)); };
+    window.addEventListener('catnip:model-setup-complete', refreshStartup);
+    return () => window.removeEventListener('catnip:model-setup-complete', refreshStartup);
+  }, []);
+
+  const handleStartupApiKeySave = useCallback(async () => {
+    setStartupApiKeySaving(true);
+    setStartupApiKeyError('');
+    try {
+      const result = await window.electronAPI.configureStartupModel();
+      setStartupApiKeySaving(false);
+      if (!result.ok) {
+        if (!result.cancelled) setStartupApiKeyError('安全凭据保存失败，请重试或检查 Windows 凭据加密是否可用。');
+        return;
+      }
+      if (result.restarting) { setStartupApiKeyRestarting(true); return; }
+      setStartupStatus(result.status);
+    } catch (error) {
+      setStartupApiKeySaving(false);
+      setStartupApiKeyError(error instanceof Error ? error.message : '无法打开安全输入窗口');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!appearanceMenuOpen) return undefined;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!appearanceSettingsRef.current?.contains(event.target as Node)) {
+        setAppearanceMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setAppearanceMenuOpen(false);
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [appearanceMenuOpen]);
+
+  useEffect(() => {
+    if (!appearanceMenuOpen) return;
+    softwareAssistantMessagesRef.current?.scrollTo({
+      top: softwareAssistantMessagesRef.current.scrollHeight,
+      behavior: softwareAssistantMessages.length > 1 ? 'smooth' : 'auto',
+    });
+  }, [appearanceMenuOpen, softwareAssistantMessages, softwareAssistantPending]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setAppearancePosition((current) => {
+        const next = clampAppearancePosition(current, assistantSize);
+        storeAppearancePosition(next);
+        return next;
+      });
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [assistantSize]);
+
+  const handleAppearancePointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    appearanceDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: appearancePosition.x,
+      originY: appearancePosition.y,
+      moved: false,
+    };
+  }, [appearancePosition]);
+
+  const handleAppearancePointerMove = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = appearanceDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
+    if (!drag.moved && Math.hypot(deltaX, deltaY) < 6) return;
+    drag.moved = true;
+    suppressAppearanceClickRef.current = true;
+    setAppearanceDragging(true);
+    setAppearanceMenuOpen(false);
+    setAppearancePosition(clampAppearancePosition({
+      x: drag.originX + deltaX,
+      y: drag.originY + deltaY,
+    }, assistantSize));
+  }, [assistantSize]);
+
+  const finishAppearanceDrag = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = appearanceDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    const next = clampAppearancePosition({
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY,
+    }, assistantSize);
+    if (drag.moved) {
+      setAppearancePosition(next);
+      storeAppearancePosition(next);
+    }
+    appearanceDragRef.current = null;
+    setAppearanceDragging(false);
+  }, [assistantSize]);
+
+  const handleAppearanceClick = useCallback(() => {
+    if (suppressAppearanceClickRef.current) {
+      suppressAppearanceClickRef.current = false;
+      return;
+    }
+    setAppearanceMenuOpen((open) => !open);
+  }, []);
+
+  const handleSoftwareAssistantSubmit = useCallback(async (event: React.FormEvent) => {
+    event.preventDefault();
+    const content = softwareAssistantInput.trim();
+    if (!content || softwareAssistantPending) return;
+
+    const userMessage: SoftwareAssistantMessage = { id: `user-${Date.now()}`, role: 'user', content };
+    const nextMessages = [...softwareAssistantMessages, userMessage];
+    setSoftwareAssistantMessages(nextMessages);
+    setSoftwareAssistantInput('');
+    setSoftwareAssistantPending(true);
+
+    try {
+      const result = await window.electronAPI.askSoftwareAssistant(
+        nextMessages.filter((message) => message.id !== 'welcome').map(({ role, content: text }) => ({ role, content: text })),
+      );
+      setSoftwareAssistantMessages((current) => [...current, {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: result.text,
+      }]);
+    } catch (error) {
+      setSoftwareAssistantMessages((current) => [...current, {
+        id: `assistant-error-${Date.now()}`,
+        role: 'assistant',
+        content: `暂时无法回答：${error instanceof Error ? error.message : String(error)}`,
+      }]);
+    } finally {
+      setSoftwareAssistantPending(false);
+    }
+  }, [softwareAssistantInput, softwareAssistantMessages, softwareAssistantPending]);
+
+  const resizeSoftwareAssistant = useCallback((delta: number) => {
+    setAssistantSize((current) => {
+      const next = clampAssistantSize(current + delta);
+      storeAssistantSize(next);
+      setAppearancePosition((position) => {
+        const clamped = clampAppearancePosition(position, next);
+        storeAppearancePosition(clamped);
+        return clamped;
+      });
+      return next;
+    });
+  }, []);
+
+  const handleOnboardingStart = useCallback(() => {
+    setLeftPanelCollapsed(false);
+    setAppearanceMenuOpen(false);
+  }, []);
+
+  const handleOnboardingEnsureAgentOpen = useCallback(() => {
+    setLeftPanelCollapsed(false);
+  }, []);
+
+  const handleOnboardingEnsureAssistantOpen = useCallback(() => {
+    setAppearanceMenuOpen(true);
+  }, []);
+
+  const handleDividerPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (leftPanelCollapsed || window.innerWidth <= 820) return;
+    event.preventDefault();
+    const divider = event.currentTarget;
+    divider.setPointerCapture(event.pointerId);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const nextWidth = (moveEvent.clientX / window.innerWidth) * 100;
+      setLeftPanelWidth(clampLeftPanelWidth(nextWidth));
+    };
+    const finishResize = (finishEvent: PointerEvent) => {
+      divider.removeEventListener('pointermove', handlePointerMove);
+      divider.removeEventListener('pointerup', finishResize);
+      divider.removeEventListener('pointercancel', finishResize);
+      if (divider.hasPointerCapture(finishEvent.pointerId)) {
+        divider.releasePointerCapture(finishEvent.pointerId);
+      }
+      document.body.classList.remove('is-resizing-panels');
+    };
+
+    document.body.classList.add('is-resizing-panels');
+    divider.addEventListener('pointermove', handlePointerMove);
+    divider.addEventListener('pointerup', finishResize);
+    divider.addEventListener('pointercancel', finishResize);
+  }, [leftPanelCollapsed]);
+
+  const handleDividerKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowLeft' ? -2 : 2;
+    setLeftPanelWidth((current) => clampLeftPanelWidth(current + delta));
+  }, []);
+
+  const refreshWorkbench = useCallback(async () => {
+    const [overview, recordingResult] = await Promise.all([
+      window.electronAPI?.getWorkbenchOverview(),
+      window.electronAPI?.listBrowserRecordingSummaries(),
+    ]);
+    if (overview) {
+      setWorkbench(overview);
+    }
+    if (recordingResult) {
+      setRecordings(recordingResult.recordings);
+    }
+    const deviceResult = await window.electronAPI?.listHardboardDevices();
+    if (deviceResult) {
+      setHardboardDevices(deviceResult.devices);
+    }
+  }, []);
+
+  const applyConversation = useCallback((conversation: ChatConversation) => {
+    activeConversationIdRef.current = conversation.id;
+    setActiveConversationId(conversation.id);
+    setMessages(conversation.messages ?? []);
+    setSteps([]);
+    setChatHistoryError('');
+  }, []);
+
+  const refreshChatConversationList = useCallback(async () => {
+    const result = await window.electronAPI?.listChatConversations();
+    if (!result) return null;
+    setChatConversations(result.conversations);
+    return result;
+  }, []);
+
+  const initializeChatHistory = useCallback(async () => {
+    try {
+      const result = await refreshChatConversationList();
+      if (!result) return;
+      const conversation = await window.electronAPI?.getChatConversation(result.activeConversationId);
+      if (conversation) applyConversation(conversation);
+    } catch (error) {
+      setChatHistoryError(`历史对话加载失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [applyConversation, refreshChatConversationList]);
+
+  useEffect(() => {
+    if (window.electronAPI) {
+      window.electronAPI.onMessage((msg) => {
+        if (msg.conversationId && activeConversationIdRef.current && msg.conversationId !== activeConversationIdRef.current) {
+          void refreshChatConversationList();
+          return;
+        }
+        const text = msg.kind === 'thinking' || normalizeResponseStreamId(msg.streamId) ? msg.text : cleanAgentText(msg.text);
+        if (!text) return;
+        const kind = inferChatMessageKind(text, msg.kind, msg.error);
+        const nextMessage: ChatMessage = {
+          id: msg.id || crypto.randomUUID(),
+          text,
+          role: 'agent',
+          timestamp: msg.timestamp,
+          kind,
+          toolName: msg.toolName,
+          error: msg.error,
+          taskId: msg.taskId,
+          streamId: normalizeResponseStreamId(msg.streamId),
+        };
+        setMessages((current) => upsertChatMessage(current, nextMessage));
+        if (msg.conversationId && kind !== 'thinking' && !nextMessage.streamId) {
+          setChatConversations((current) => current
+            .map((conversation) => conversation.id === msg.conversationId
+              ? { ...conversation, preview: text.replace(/\s+/g, ' ').slice(0, 30), updatedAt: new Date(msg.timestamp).toISOString(), messageCount: conversation.messageCount + (kind === 'status' ? 0 : 1) }
+              : conversation)
+            .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)));
+        }
+      });
+
+      window.electronAPI.onTaskProgress((result) => {
+        setSteps(result.steps);
+      });
+
+      window.electronAPI.onTaskComplete(() => {
+        void refreshChatConversationList();
+      });
+
+      window.electronAPI.onTaskStatus((result) => setTaskStatus(result));
+      void window.electronAPI.getTaskStatus().then((result) => setTaskStatus(result));
+
+      window.electronAPI.onBrowserTabs((result) => {
+        setTabs(result.tabs);
+        const active = result.tabs.find((tab) => tab.active);
+        if (active) {
+          setBrowserUrl(active.url);
+        }
+      });
+
+      window.electronAPI.listBrowserTabs().then((result) => {
+        setTabs(result.tabs);
+        const active = result.tabs.find((tab) => tab.active);
+        if (active) {
+          setBrowserUrl(active.url);
+        }
+      });
+
+      void refreshWorkbench();
+    }
+  }, [initializeChatHistory, refreshChatConversationList, refreshWorkbench]);
+
+  useEffect(() => {
+    if (!projectSession?.activeProject) {
+      activeConversationIdRef.current = '';
+      setActiveConversationId('');
+      setChatConversations([]);
+      setMessages([]);
+      return;
+    }
+    void initializeChatHistory();
+    void refreshWorkbench();
+  }, [initializeChatHistory, projectSession?.activeProject?.id, refreshWorkbench]);
+
+  const handleSend = useCallback((task: string | AgentTaskInput, mode: TaskSubmitMode = 'auto') => {
+    if (!projectSession?.activeProject) {
+      setProjectSessionError('请先选择当前工作工程，再让 Agent 执行项目任务');
+      setProjectPickerOpen(true);
+      return;
+    }
+    const request = typeof task === 'string' ? { text: task, skillRefs: [], attachments: [] } : task;
+    const text = request.text;
+    const conversationId = activeConversationIdRef.current;
+    if (!conversationId) {
+      setChatHistoryError('历史对话尚未加载完成，请稍后再试');
+      return;
+    }
+    if (chatConversations.find((conversation) => conversation.id === conversationId)?.readOnly) {
+      setChatHistoryError('未归属历史为只读；请新建当前工程对话后再发送');
+      return;
+    }
+    const msg: ChatMessage = {
+      id: crypto.randomUUID(),
+      text,
+      role: 'user',
+      timestamp: Date.now(),
+      skillRefs: request.skillRefs,
+      attachments: request.attachments,
+    };
+    setMessages(prev => [...prev, msg]);
+    setChatConversations((current) => current
+      .map((conversation) => conversation.id === conversationId
+        ? {
+          ...conversation,
+          title: conversation.title === '新对话' ? text.replace(/\s+/g, ' ').slice(0, 30) : conversation.title,
+          preview: text.replace(/\s+/g, ' ').slice(0, 30),
+          updatedAt: new Date(msg.timestamp).toISOString(),
+          messageCount: conversation.messageCount + 1,
+        }
+        : conversation)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)));
+
+    setSteps([]);
+
+    void window.electronAPI?.sendMessage(request, mode, conversationId, msg.id, msg.timestamp).then(() => {
+      void refreshChatConversationList();
+    }).catch((error) => {
+      setMessages(prev => [...prev, {
+        id: crypto.randomUUID(),
+        text: `发送失败: ${error instanceof Error ? error.message : String(error)}`,
+        role: 'agent',
+        timestamp: Date.now(),
+        error: true,
+      }]);
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    });
+  }, [chatConversations, projectSession?.activeProject, refreshChatConversationList]);
+
+  const handleCreateConversation = useCallback(async () => {
+    try {
+      const conversation = await window.electronAPI?.createChatConversation();
+      if (!conversation) return;
+      applyConversation(conversation);
+      await refreshChatConversationList();
+    } catch (error) {
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, [applyConversation, refreshChatConversationList]);
+
+  const handleSelectConversation = useCallback(async (id: string) => {
+    if (id === activeConversationIdRef.current) return;
+    try {
+      const readOnly = chatConversations.find((conversation) => conversation.id === id)?.readOnly;
+      const conversation = readOnly
+        ? await window.electronAPI?.getChatConversation(id)
+        : await window.electronAPI?.activateChatConversation(id);
+      if (conversation) applyConversation(conversation);
+    } catch (error) {
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, [applyConversation, chatConversations]);
+
+  const handleDeleteConversation = useCallback(async (id: string) => {
+    try {
+      const result = await window.electronAPI?.deleteChatConversation(id);
+      if (!result) return;
+      setChatConversations(result.conversations);
+      if (id === activeConversationIdRef.current) {
+        const conversation = await window.electronAPI?.getChatConversation(result.activeConversationId);
+        if (conversation) applyConversation(conversation);
+      }
+    } catch (error) {
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, [applyConversation]);
+
+  const handleRenameConversation = useCallback(async (id: string, title: string) => {
+    try {
+      const result = await window.electronAPI?.renameChatConversation(id, title);
+      if (result) setChatConversations(result.conversations);
+      setChatHistoryError('');
+    } catch (error) {
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const handleToggleConversationPinned = useCallback(async (id: string, pinned: boolean) => {
+    try {
+      const result = await window.electronAPI?.setChatConversationPinned(id, pinned);
+      if (result) setChatConversations(result.conversations);
+      setChatHistoryError('');
+    } catch (error) {
+      setChatHistoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const handleActivateProject = useCallback(async () => {
+    if (!selectedProjectId || projectSessionSaving || boardInfoPicking) return;
+    setProjectSessionSaving(true);
+    setProjectSessionError('');
+    try {
+      const result = await window.electronAPI.activateProjectSession(selectedProjectId);
+      setProjectSession(result);
+      setProjectPickerOpen(false);
+      setNewProjectName('');
+      if (newProjectBoardInfo) void window.electronAPI.releaseBoardInfoDraft(newProjectBoardInfo.id).catch(() => {});
+      setNewProjectBoardInfo(null);
+    } catch (error) {
+      setProjectSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProjectSessionSaving(false);
+    }
+  }, [projectSessionSaving, selectedProjectId, boardInfoPicking, newProjectBoardInfo]);
+
+  const handlePickBoardInfo = useCallback(async () => {
+    if (projectSessionSaving || boardInfoPicking) return;
+    setBoardInfoPicking(true);
+    setProjectSessionError('');
+    try {
+      const result = await window.electronAPI.pickBoardInfo();
+      if (!result.ok) setProjectSessionError(result.error);
+      else if (result.package) {
+        if (newProjectBoardInfo) void window.electronAPI.releaseBoardInfoDraft(newProjectBoardInfo.id).catch(() => {});
+        setNewProjectBoardInfo(result.package);
+      }
+    } catch (error) {
+      setProjectSessionError(error instanceof Error ? error.message : String(error));
+    } finally { setBoardInfoPicking(false); }
+  }, [projectSessionSaving, boardInfoPicking, newProjectBoardInfo]);
+
+  const handleCreateProject = useCallback(async () => {
+    const name = newProjectName.trim();
+    if (!name || projectSessionSaving || boardInfoPicking) return;
+    setProjectSessionSaving(true);
+    setProjectSessionError('');
+    try {
+      const result = await window.electronAPI.createProjectSession(name, newProjectBoardInfo?.id);
+      setProjectSession(result);
+      setSelectedProjectId(result.createdProject.id);
+      setProjectPickerOpen(false);
+      setNewProjectName('');
+      setNewProjectBoardInfo(null);
+    } catch (error) {
+      setProjectSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProjectSessionSaving(false);
+    }
+  }, [newProjectName, projectSessionSaving, boardInfoPicking, newProjectBoardInfo]);
+
+  const handleStopTask = useCallback(() => {
+    void window.electronAPI?.stopTask();
+  }, []);
+
+  const handleNavigate = useCallback((url: string) => {
+    setBrowserUrl(url);
+    window.electronAPI?.navigateBrowser(url);
+  }, []);
+
+  const handleActivateTab = useCallback((id: string) => {
+    window.electronAPI?.activateBrowserTab(id);
+  }, []);
+
+  const handleCloseTab = useCallback((id: string) => {
+    window.electronAPI?.closeBrowserTab(id);
+  }, []);
+
+  const handleStartRecording = useCallback(async (label: string) => {
+    await window.electronAPI?.startBrowserRecording();
+    setActiveRecordingName(label);
+    setIsRecording(true);
+    setRecordingSummary(label ? `录制中: ${label}` : '录制中...');
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      text: label ? `浏览器录制已开始: ${label}` : '浏览器录制已开始',
+      role: 'agent',
+      timestamp: Date.now(),
+    }]);
+  }, []);
+
+  const handleStopRecording = useCallback(async (label: string) => {
+    const finalLabel = label || activeRecordingName || 'browser-recording';
+    const result = await window.electronAPI?.stopBrowserRecording(finalLabel);
+    setIsRecording(false);
+    setActiveRecordingName('');
+    if (!result) return;
+    setRecordingSummary(`最近录制: ${finalLabel} · ${result.actionCount} 个动作`);
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      text: `录制已保存: ${finalLabel}\n${result.file} (${result.actionCount} 个动作)`,
+      role: 'agent',
+      timestamp: Date.now(),
+    }]);
+    void refreshWorkbench();
+  }, [activeRecordingName, refreshWorkbench]);
+
+  const handleReplayRecording = useCallback(async (target: string) => {
+    const result = target
+      ? await window.electronAPI?.replayBrowserRecording(target)
+      : await window.electronAPI?.replayLatestBrowserRecording();
+    if (!result) return;
+    if (!result.ok) {
+      setMessages(prev => [...prev, {
+        id: crypto.randomUUID(),
+        text: result.error ?? '回放失败',
+        role: 'agent',
+        timestamp: Date.now(),
+        error: true,
+      }]);
+      return;
+    }
+    setRecordingSummary(`最近回放: ${result.actionCount} 个动作`);
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      text: `已回放录制: ${result.file} (${result.actionCount} 个动作)`,
+      role: 'agent',
+      timestamp: Date.now(),
+    }]);
+  }, []);
+
+  const handleRefreshHardboardDevices = useCallback(async () => {
+    const result = await window.electronAPI?.listHardboardDevices();
+    if (!result) return;
+    setHardboardDevices(result.devices);
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      text: result.devices.length
+        ? `已发现硬件设备:\n${result.devices.map((device) => `${device.port} · ${device.label}`).join('\n')}`
+        : '未发现串口设备，请确认 ESP32-S3 已连接并安装串口驱动。',
+      role: 'agent',
+      timestamp: Date.now(),
+      error: result.devices.length === 0,
+    }]);
+  }, []);
+
+  const handleHardboardBuild = useCallback(() => {
+    handleSend('使用 hardboard.idf_build 编译当前 hardboard ESP32-S3 工程。先调用 hardboard.env_status 检查 ESP-IDF 5.4.3 环境，再选择 runtime/hardboard/projects 或示例工程执行构建，并把完整命令和结果摘要展示出来。');
+  }, [handleSend]);
+
+  const handleHardboardFlash = useCallback((port: string) => {
+    const deviceHint = port ? `串口端口是 ${port}。` : '请先调用 hardboard.devices_list 选择可用串口。';
+    handleSend(`使用 hardboard.idf_flash 烧录当前 hardboard ESP32-S3 工程。${deviceHint}烧录前先确认 ESP-IDF 5.4.3 环境和项目目录，失败时输出具体错误。`);
+  }, [handleSend]);
+
+  const handleRefreshWorkbench = useCallback(async () => {
+    await refreshWorkbench();
+  }, [refreshWorkbench]);
+
+  const handleOpenWorkbenchItem = useCallback(async (targetPath: string) => {
+    const result = await window.electronAPI?.openWorkbenchItem(targetPath);
+    if (!result) return;
+    setMessages(prev => [...prev, {
+      id: crypto.randomUUID(),
+      text: result.ok
+        ? `已打开工作台项目: ${result.path}`
+        : `打开工作台项目失败: ${result.error}`,
+      role: 'agent',
+      timestamp: Date.now(),
+      error: !result.ok,
+    }]);
+    if (window.electronAPI?.isWorkbenchSmokeTest) {
+      await window.electronAPI.finishWorkbenchSmokeTest?.({
+        source: 'workspace-item-click',
+        targetPath,
+        ...result,
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.isWorkbenchSmokeTest || workbenchSmokeTriggered.current || !workbench) {
+      return;
+    }
+    const hasItem = workbench.sections.some((section) => section.items.length > 0);
+    if (!hasItem) {
+      void window.electronAPI.finishWorkbenchSmokeTest?.({
+        ok: false,
+        error: '工作台没有可点击项目',
+      });
+      return;
+    }
+
+    workbenchSmokeTriggered.current = true;
+    window.setTimeout(() => {
+      const skillManager = document.querySelector<HTMLElement>('.skill-manager');
+      const resourceSections = [...document.querySelectorAll<HTMLElement>('[data-workbench-resource]')];
+      const headers = resourceSections.map((section) => section.querySelector<HTMLElement>('.workspace-resource-toggle'));
+      const skillComesFirst = Boolean(skillManager && resourceSections[0]
+        && (skillManager.compareDocumentPosition(resourceSections[0]) & Node.DOCUMENT_POSITION_FOLLOWING));
+      const resourcesAlwaysExpanded = headers.length > 0 && headers.every((header) => header?.getAttribute('aria-expanded') === 'true');
+      const resourcesVisibleTogether = resourceSections.every((section) => Boolean(section.querySelector<HTMLButtonElement>('.workspace-item-button')));
+      const resourcesShowFolders = resourceSections.every((section) => [...section.querySelectorAll<HTMLElement>('.workspace-item-button')]
+        .every((item) => item.dataset.workbenchKind === 'dir'));
+      const resourcesHaveSync = resourceSections.every((section) => Boolean(section.querySelector<HTMLButtonElement>('.workspace-sync-folder')));
+      const resourcesHaveOpenDirectory = resourceSections.every((section) => (
+        section.querySelector<HTMLButtonElement>('.workspace-open-folder')?.textContent?.trim() === '打开目录'
+      ));
+      const button = resourceSections[0]?.querySelector<HTMLButtonElement>('.workspace-item-button');
+      if (!skillComesFirst || !resourcesAlwaysExpanded || !resourcesVisibleTogether || !resourcesShowFolders
+        || !resourcesHaveSync || !resourcesHaveOpenDirectory || !button) {
+        void window.electronAPI.finishWorkbenchSmokeTest?.({
+          ok: false,
+          error: '仓库页未保持 Skills 优先、资源始终展开、工程目录展示或双操作入口',
+        });
+        return;
+      }
+      button.click();
+    }, 500);
+  }, [workbench]);
+
+  return (
+    <div className="app">
+      <div
+        className={`app-body${leftPanelCollapsed ? ' app-body--left-collapsed' : ''}`}
+        style={{ '--left-panel-width': `${leftPanelWidth}%` } as React.CSSProperties}
+      >
+        {!leftPanelCollapsed ? (
+          <div className="left-panel" data-tour-id="agent-workspace">
+            <ChatPanel
+              messages={messages}
+              steps={steps}
+              conversations={chatConversations}
+              activeConversationId={activeConversationId}
+              historyError={chatHistoryError}
+              taskStatus={taskStatus}
+              onSend={handleSend}
+              onStop={handleStopTask}
+              onCreateConversation={handleCreateConversation}
+              onSelectConversation={handleSelectConversation}
+              onDeleteConversation={handleDeleteConversation}
+              onRenameConversation={handleRenameConversation}
+              onToggleConversationPinned={handleToggleConversationPinned}
+            />
+          </div>
+        ) : null}
+        <div
+          className="panel-divider"
+          role="separator"
+          aria-label="调整对话区宽度"
+          aria-orientation="vertical"
+          aria-valuemin={24}
+          aria-valuemax={52}
+          aria-valuenow={Math.round(leftPanelWidth)}
+          tabIndex={leftPanelCollapsed ? -1 : 0}
+          onPointerDown={handleDividerPointerDown}
+          onKeyDown={handleDividerKeyDown}
+        >
+          <button
+            className="panel-divider-toggle"
+            data-tour-id="agent-panel-toggle"
+            type="button"
+            title={leftPanelCollapsed ? '展开对话区' : '收起对话区'}
+            aria-label={leftPanelCollapsed ? '展开对话区' : '收起对话区'}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => setLeftPanelCollapsed((current) => !current)}
+          >
+            {leftPanelCollapsed ? '›' : '‹'}
+          </button>
+        </div>
+        <div className="right-panel">
+          <BrowserPanel
+            startInCustomModelSetup={startupUseCustomProvider}
+            onReturnToStartupSetup={() => setStartupUseCustomProvider(false)}
+            activeProject={projectSession?.activeProject || null}
+            onRequestProjectChange={() => setProjectPickerOpen(true)}
+            onOpenSettings={() => setAppearanceMenuOpen(true)}
+            url={browserUrl}
+            onNavigate={handleNavigate}
+            tabs={tabs}
+            onActivateTab={handleActivateTab}
+            onCloseTab={handleCloseTab}
+            isRecording={isRecording}
+            recordingSummary={recordingSummary}
+            recordings={recordings}
+            hardboardDevices={hardboardDevices}
+            onStartRecording={handleStartRecording}
+            onStopRecording={handleStopRecording}
+            onReplayRecording={handleReplayRecording}
+            onRefreshHardboardDevices={handleRefreshHardboardDevices}
+            onHardboardBuild={handleHardboardBuild}
+            onHardboardFlash={handleHardboardFlash}
+            workbench={workbench}
+            onRefreshWorkbench={handleRefreshWorkbench}
+            onOpenWorkbenchItem={handleOpenWorkbenchItem}
+          />
+        </div>
+      </div>
+      {startupStatus?.firstRun && !startupUseCustomProvider ? (
+        <div className="startup-key-backdrop">
+          <section className="startup-key-dialog" role="dialog" aria-modal="true" aria-labelledby="startup-model-title">
+            <div className="startup-key-brand"><img src={catnipForgeIcon} alt="Catnip Forge" /><span>Catnip Forge</span></div>
+            <div className="startup-key-positioning">硬件智能开发平台 · Autonomous Hardware Development Agent</div>
+            <h2 id="startup-model-title">配置预设模型</h2>
+            <p>DeepSeek 用于 Agent、找灵感和解问题；千问用于可选的视觉任务。点击后会打开独立的 Windows 安全输入窗口。</p>
+            <p>DeepSeek API Key 必填，千问 API Key 选填；Key 不会进入本页面、聊天、日志或普通配置文件。</p>
+            {startupApiKeyError ? <div className="startup-key-error" role="alert">{startupApiKeyError}</div> : null}
+            <button type="button" autoFocus onClick={() => void handleStartupApiKeySave()} disabled={startupApiKeySaving || startupApiKeyRestarting}>
+              {startupApiKeyRestarting ? '配置完成，正在重启…' : startupApiKeySaving ? '正在打开安全窗口…' : '配置 DeepSeek / 千问'}
+            </button>
+            <button type="button" className="startup-key-alternative" onClick={() => setStartupUseCustomProvider(true)} disabled={startupApiKeySaving || startupApiKeyRestarting}>使用其他模型供应商</button>
+            {startupApiKeyRestarting ? <div className="startup-key-restarting" role="status">Catnip Forge 将自动重新打开，随后请选择工作区文件夹。</div> : <small>其他供应商将进入 Claude Code 供应商管理，完成启用后首次重启。</small>}
+          </section>
+        </div>
+      ) : null}
+      {startupStatus && !startupStatus.firstRun && projectPickerOpen ? (
+        <div className='project-picker-backdrop'>
+          <section className='project-picker-dialog' role='dialog' aria-modal='true' aria-labelledby='project-picker-title'>
+            <header>
+              <div><span>CURRENT PROJECT</span><h2 id='project-picker-title'>选择工作工程</h2></div>
+              {projectSession?.activeProject ? <button type='button' disabled={projectSessionSaving || boardInfoPicking} onClick={() => setProjectPickerOpen(false)} aria-label='关闭工程选择'>×</button> : null}
+            </header>
+            <p>Agent、编辑器、探索历史、Build、Flash 与 Serial 将共同使用这个工程。每次启动都需要你明确确认。</p>
+            <code title={projectSession?.projectsRoot}>{projectSession?.projectsRoot || '正在读取 hardboard/projects…'}</code>
+            <form onSubmit={(event) => { event.preventDefault(); void handleActivateProject(); }}>
+              <label><span>现有工程</span>
+                <select value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.target.value)} disabled={projectSessionSaving || boardInfoPicking}>
+                  <option value=''>请选择工程</option>
+                  {(projectSession?.projects || []).map((project) => (
+                    <option key={project.id} value={project.id}>{project.name}{project.id === projectSession?.suggestedProjectId ? ' · 上次使用' : ''}</option>
+                  ))}
+                </select>
+              </label>
+              <button type='submit' disabled={!selectedProjectId || projectSessionSaving || boardInfoPicking}>{projectSessionSaving ? '正在切换…' : '进入这个工程'}</button>
+            </form>
+            {projectSession?.projects.find(project => project.id === selectedProjectId)?.boardInfo ? (
+              <div className='project-board-binding'>已绑定板卡资料：{projectSession.projects.find(project => project.id === selectedProjectId)?.boardInfo?.name}</div>
+            ) : null}
+            {projectSession?.projects.find(project => project.id === selectedProjectId)?.boardInfoError ? (
+              <div className='project-picker-error' role='alert'>{projectSession.projects.find(project => project.id === selectedProjectId)?.boardInfoError}</div>
+            ) : null}
+            <div className='project-picker-divider'><span>或者新建</span></div>
+            <form className='project-create-form' onSubmit={(event) => { event.preventDefault(); void handleCreateProject(); }}>
+              <label><span>新工程名称</span><input value={newProjectName} maxLength={64} disabled={projectSessionSaving || boardInfoPicking} onChange={(event) => setNewProjectName(event.target.value)} placeholder='例如 desktop_pet' /></label>
+              <div className='project-board-info'>
+                <div className='project-board-info-actions'>
+                  <span>板卡信息包 <small>可选</small></span>
+                  <button type='button' onClick={() => void handlePickBoardInfo()} disabled={projectSessionSaving || boardInfoPicking}>{boardInfoPicking ? '正在校验…' : '选择板卡信息包'}</button>
+                  {newProjectBoardInfo ? <button type='button' onClick={() => { void window.electronAPI.releaseBoardInfoDraft(newProjectBoardInfo.id).catch(() => {}); setNewProjectBoardInfo(null); setProjectSessionError(''); }} disabled={projectSessionSaving || boardInfoPicking}>移除选择</button> : null}
+                </div>
+                {newProjectBoardInfo ? <div className='project-board-info-preview' role='status'>
+                  <strong>{newProjectBoardInfo.name}</strong>
+                  <span>{newProjectBoardInfo.archiveName} · v{newProjectBoardInfo.version}</span>
+                  <span>芯片：{newProjectBoardInfo.chip} · 显示：{newProjectBoardInfo.display || '未声明'}</span>
+                  <small>已校验 · {newProjectBoardInfo.documents.length} 份文本资料 · 创建后随工程保存</small>
+                </div> : <small>选择板卡资料 ZIP，让 Agent 从资料读取硬件配置。也可暂不导入。</small>}
+              </div>
+              <button type='submit' disabled={!newProjectName.trim() || projectSessionSaving || boardInfoPicking}>{projectSessionSaving ? '正在创建…' : '创建并进入'}</button>
+            </form>
+            {projectSessionError ? <div className='project-picker-error' role='alert'>{projectSessionError}</div> : null}
+            <small>不会自动使用列表第一项或旧 Runtime 工程；创建工程不会自动 Build 或 Flash。</small>
+          </section>
+        </div>
+      ) : null}
+      <CatnipOnboarding
+        enabled={Boolean(ONBOARDING_SMOKE_MODE || (startupStatus && !startupStatus.firstRun && projectSession?.activeProject && !window.electronAPI?.isWorkbenchSmokeTest))}
+        startRequest={onboardingStartRequest}
+        onStart={handleOnboardingStart}
+        onEnsureAgentOpen={handleOnboardingEnsureAgentOpen}
+        onEnsureAssistantOpen={handleOnboardingEnsureAssistantOpen}
+      />
+      {ONBOARDING_SMOKE_MODE || (startupStatus && !startupStatus.firstRun) ? <div
+        className={`appearance-settings${appearanceDragging ? ' is-dragging' : ''}${appearancePosition.x < 382 ? ' opens-right' : ''}${appearancePosition.y < 520 ? ' opens-down' : ''}`}
+        ref={appearanceSettingsRef}
+        style={{ left: appearancePosition.x, top: appearancePosition.y, width: assistantSize, height: assistantSize }}
+      >
+        {appearanceMenuOpen ? (
+          <section className="appearance-popover software-assistant-popover" role="dialog" aria-label="刘看山软件使用助手">
+            <header className="software-assistant-header">
+              <div className="software-assistant-identity">
+                <span className="software-assistant-avatar" aria-hidden="true"><img src={liukanshanAvatarImage} alt="" /></span>
+                <span className="software-assistant-identity-copy">
+                  <strong>刘看山</strong>
+                  <small>Catnip Forge 吉祥物与使用助手</small>
+                  <button
+                    type="button"
+                    className="software-assistant-author-link"
+                    onClick={() => void window.electronAPI.openExternalUrl(AUTHOR_GITHUB_URL)}
+                    title="在系统默认浏览器打开 Neil Bauman 的 GitHub"
+                    aria-label="在系统浏览器打开 Neil Bauman 的 GitHub"
+                  >
+                    <img src={githubMarkImage} alt="" aria-hidden="true" />
+                    <span>Neil Bauman · GitHub</span>
+                    <span aria-hidden="true">↗</span>
+                  </button>
+                </span>
+              </div>
+              <div className="software-assistant-actions" role="group" aria-label="助手设置">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAppearanceMenuOpen(false);
+                    setOnboardingStartRequest((current) => current + 1);
+                  }}
+                  title="新手教程：带我认识 Catnip Forge"
+                  aria-label="打开新手教程"
+                >
+                  ?
+                </button>
+                <button type="button" disabled={assistantSize <= MIN_ASSISTANT_SIZE} onClick={() => resizeSoftwareAssistant(-ASSISTANT_SIZE_STEP)} title="缩小刘看山" aria-label="缩小刘看山">−</button>
+                <button type="button" disabled={assistantSize >= MAX_ASSISTANT_SIZE} onClick={() => resizeSoftwareAssistant(ASSISTANT_SIZE_STEP)} title="放大刘看山" aria-label="放大刘看山">＋</button>
+                <button type="button" onClick={() => setAppearanceMenuOpen(false)} title="关闭助手" aria-label="关闭助手">×</button>
+              </div>
+            </header>
+            <div className="software-assistant-messages" ref={softwareAssistantMessagesRef} aria-live="polite">
+              {softwareAssistantMessages.map((message) => (
+                <div className={`software-assistant-message software-assistant-message--${message.role}`} key={message.id}>
+                  {message.role === 'assistant' ? <MarkdownContent text={message.content} /> : <p>{message.content}</p>}
+                </div>
+              ))}
+              {softwareAssistantPending ? (
+                <div className="software-assistant-typing" role="status" aria-label="刘看山正在回答"><i /><i /><i /></div>
+              ) : null}
+            </div>
+            <form className="software-assistant-composer" onSubmit={handleSoftwareAssistantSubmit}>
+              <textarea
+                rows={2}
+                value={softwareAssistantInput}
+                maxLength={2000}
+                disabled={softwareAssistantPending}
+                placeholder="问我怎么使用 Catnip Forge…"
+                aria-label="向刘看山提问"
+                onChange={(event) => setSoftwareAssistantInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+              />
+              <button type="submit" disabled={!softwareAssistantInput.trim() || softwareAssistantPending} aria-label="发送问题">↑</button>
+            </form>
+            <footer>仅回答软件使用问题 · 回答由 DeepSeek 生成</footer>
+          </section>
+        ) : null}
+        <button
+          className={`appearance-settings-trigger${appearanceMenuOpen ? ' is-open' : ''}`}
+          data-tour-id="assistant-trigger"
+          type="button"
+          title="刘看山（可拖动）"
+          aria-label="打开刘看山软件使用助手"
+          aria-haspopup="dialog"
+          aria-expanded={appearanceMenuOpen}
+          onPointerDown={handleAppearancePointerDown}
+          onPointerMove={handleAppearancePointerMove}
+          onPointerUp={finishAppearanceDrag}
+          onPointerCancel={finishAppearanceDrag}
+          onClick={handleAppearanceClick}
+        >
+          <img src={catnipAssistantImage} alt="" aria-hidden="true" />
+        </button>
+      </div> : null}
+    </div>
+  );
+}

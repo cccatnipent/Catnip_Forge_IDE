@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'">
+  <title>屏幕动画隔离沙箱</title>
+</head>
+<body>
+<script>
+  let worker;
+  onmessage = event => {
+    if (event.source !== parent) return;
+    if (event.data?.type === 'init' && !worker) {
+      const url = URL.createObjectURL(new Blob([event.data.workerSource], {type: 'text/javascript'}));
+      try {
+        worker = new Worker(url);
+        worker.onmessage = message => {
+          if (message.data.type === 'frame') parent.postMessage(message.data, '*', [message.data.bitmap]);
+          else parent.postMessage(message.data, '*');
+        };
+        worker.onerror = error => parent.postMessage({type: 'error', message: error.message}, '*');
+      } catch (error) {
+        parent.postMessage({type: 'error', message: String(error)}, '*');
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+    worker?.postMessage(event.data);
+  };
+</script>
+</body>
+</html>

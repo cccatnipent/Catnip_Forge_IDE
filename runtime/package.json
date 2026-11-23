@@ -1,0 +1,26 @@
+{
+  "name": "@vibeide/runtime",
+  "version": "2.0.0-7201",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "node node_modules/tsx/dist/cli.mjs src/index.ts health",
+    "build": "node node_modules/typescript/lib/tsc.js",
+    "start": "node node_modules/tsx/dist/cli.mjs src/index.ts mcp",
+    "mcp": "node node_modules/tsx/dist/cli.mjs src/index.ts mcp",
+    "connect": "node node_modules/tsx/dist/cli.mjs src/index.ts connect",
+    "typecheck": "node node_modules/typescript/lib/tsc.js --noEmit",
+    "smoke:hardboard": "npm run build && node scripts/verify_hardboard_build.mjs",
+    "verify:event-clear": "npm run build && node scripts/verify_event_history_clear.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "playwright": "^1.48.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.6.0"
+  }
+}
